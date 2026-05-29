@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <stdexcept>
 
@@ -135,7 +136,8 @@ struct Engine::Impl {
             ::tts_cpp::detail::set_opencl_cache_dir(opts.opencl_cache_dir);
         }
 
-        if (!load_supertonic_gguf(opts.model_gguf_path, model, opts.n_gpu_layers, false)) {
+        if (!load_supertonic_gguf(opts.model_gguf_path, model, opts.n_gpu_layers,
+                                  std::getenv("QVAC_VERBOSE") != nullptr)) {
             throw std::runtime_error("Supertonic Engine: failed to load GGUF: " +
                                      opts.model_gguf_path);
         }
