@@ -1965,10 +1965,11 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
 
     graph_cache & cache = g_hift_graph_cache;
     const int64_t cache_key = pack_hift_key(T_mel, T_stft);
-    // Always rebuild: the scheduler's alloc_graph mutates node->src[] (the GPU<->CPU
-    // copies around the CPU-routed conv_transpose_1d), so a cached graph can't be
-    // reused. HiFT builds once per synth — negligible cost.
-    const bool build_graph = true;
+    // Reuse the same-shape HiFT graph only when the direct backend path owns a
+    // cached gallocator. The scheduler path leaves cache.allocr null because
+    // ggml_backend_sched_alloc_graph mutates node->src[] while inserting
+    // GPU<->CPU copies, so scheduler-routed calls must rebuild from a clean graph.
+    const bool build_graph = (cache.key != cache_key) || (cache.ctx == nullptr) || (cache.allocr == nullptr);
     if (build_graph) {
         if (cache.allocr) { ggml_gallocr_free(cache.allocr); cache.allocr = nullptr; }
         if (cache.ctx)    { ggml_free(cache.ctx);            cache.ctx    = nullptr; }
@@ -2122,8 +2123,8 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
     y_trim = ggml_clamp(ctx, y_trim, -0.99f, 0.99f);
     ggml_set_name(y_trim, "wav"); ggml_set_output(y_trim);
     ggml_build_forward_expand(gf, y_trim);
-    // No gallocr here — this graph is allocated by the model scheduler
-    // (s3gen_sched_alloc below) so conv_transpose_1d can be routed to CPU.
+    // Direct backends allocate cache.allocr below; scheduler-routed backends
+    // allocate via s3gen_sched_alloc so conv_transpose_1d can run on CPU.
     }  // end build_graph
 
     // Cached scaffolding (pulled outside build_graph too — when the graph
@@ -2146,11 +2147,12 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
     for (int i = 0; i < hift_n_nodes; ++i) {
         if (!ggml_backend_supports_op(m.backend, ggml_graph_node(gf, i))) { primary_runs_all = false; break; }
     }
-    ggml_gallocr_t hift_allocr = nullptr;
     if (primary_runs_all) {
-        hift_allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-        ggml_gallocr_reserve(hift_allocr, gf);
-        ggml_gallocr_alloc_graph(hift_allocr, gf);
+        if (!cache.allocr) {
+            cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
+            ggml_gallocr_reserve(cache.allocr, gf);
+        }
+        ggml_gallocr_alloc_graph(cache.allocr, gf);
     } else {
         s3gen_sched_alloc(m, gf);
     }
@@ -2189,10 +2191,6 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
     ggml_tensor * y_trim_out = ggml_graph_get_tensor(gf, "wav");
     std::vector<float> wav(ggml_nelements(y_trim_out));
     ggml_backend_tensor_get(y_trim_out, wav.data(), 0, ggml_nbytes(y_trim_out));
-    // Free the direct-path allocr only AFTER reading the output — y_trim_out's
-    // data lives in this buffer (freeing it earlier is a use-after-free in the
-    // tensor_get above). nullptr on the scheduler path, so the guard covers both.
-    if (hift_allocr) ggml_gallocr_free(hift_allocr);
     return wav;
 }
 
