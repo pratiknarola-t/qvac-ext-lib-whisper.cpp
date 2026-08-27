@@ -53,12 +53,30 @@ def clap_sampling_rate(processor: Any) -> int:
     return int(rate)
 
 
+def resample_to (waveform: Any, orig_rate: int, target_rate: int) -> Any:
+    """Linear-interpolation resample. CLAP's feature extractor requires an
+    exact sampling-rate match (it errors rather than resampling itself), and
+    generated WAVs are not necessarily at CLAP's 48 kHz -- MiniMax-Music3
+    outputs 44.1 kHz. CLAP scoring only needs the waveform close enough to
+    place it correctly in the shared embedding space, not lossless audio
+    quality, so a dependency-free numpy resample is used instead of pulling
+    in torchaudio/scipy/librosa for this alone."""
+    import numpy as np
+    if orig_rate == target_rate:
+        return waveform
+    duration = waveform.shape[0] / orig_rate
+    target_length = int(round(duration * target_rate))
+    orig_times = np.linspace(0, duration, num=waveform.shape[0], endpoint=False)
+    target_times = np.linspace(0, duration, num=target_length, endpoint=False)
+    return np.interp(target_times, orig_times, waveform).astype(np.float32)
+
+
 def score_waveform (model: Any, processor: Any, waveform: Any, sample_rate: int, text: str, device: str) -> float:
     import torch
 
     text_inputs = processor(text=[text], return_tensors='pt', padding=True)
     audio_inputs = processor(
-        audios=[waveform],
+        audio=[waveform],
         sampling_rate=sample_rate,
         return_tensors='pt',
         padding=True
@@ -66,8 +84,12 @@ def score_waveform (model: Any, processor: Any, waveform: Any, sample_rate: int,
     text_inputs = {key: value.to(device) for key, value in text_inputs.items()}
     audio_inputs = {key: value.to(device) for key, value in audio_inputs.items()}
     with torch.no_grad():
-        text_emb = model.get_text_features(**text_inputs)
-        audio_emb = model.get_audio_features(**audio_inputs)
+        # get_text_features/get_audio_features return the full model output,
+        # not a bare tensor -- the projected embedding is pooler_output
+        # (already normalized internally, but normalize again explicitly
+        # rather than depend on that staying true).
+        text_emb = model.get_text_features(**text_inputs).pooler_output
+        audio_emb = model.get_audio_features(**audio_inputs).pooler_output
         text_emb = torch.nn.functional.normalize(text_emb, dim=-1)
         audio_emb = torch.nn.functional.normalize(audio_emb, dim=-1)
         score = (text_emb * audio_emb).sum(dim=-1)
@@ -83,6 +105,10 @@ def score_item (model: Any, processor: Any, item: dict[str, Any], device: str) -
         return {'id': item_id, 'ok': False, 'score': None, 'error': 'item needs wav and text', 'elapsedMs': 0}
     try:
         waveform, sample_rate = load_mono_wav(wav_path)
+        target_rate = clap_sampling_rate(processor)
+        if sample_rate != target_rate:
+            waveform = resample_to(waveform, sample_rate, target_rate)
+            sample_rate = target_rate
         score = score_waveform(model, processor, waveform, sample_rate, text, device)
         elapsed_ms = (time.perf_counter() - started) * 1000
         return {'id': item_id, 'ok': True, 'score': score, 'error': None, 'elapsedMs': elapsed_ms}
