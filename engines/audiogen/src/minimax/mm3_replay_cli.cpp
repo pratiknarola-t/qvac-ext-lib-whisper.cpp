@@ -99,8 +99,13 @@ std::vector<T> read_raw_or_exit(const std::string & path) {
 }
 
 bool load_model(const CliOptions & options, MM3Model & model, std::string * error) {
-    const tts_cpp::minimax::detail::ModelPair pair =
-        tts_cpp::minimax::detail::resolve_model_pair(options.models, "", "");
+    tts_cpp::minimax::detail::ModelPair pair;
+    try {
+        pair = tts_cpp::minimax::detail::resolve_model_pair(options.models, "", "");
+    } catch (const std::exception & e) {
+        *error = e.what();
+        return false;
+    }
     model.models_dir = options.models;
     mm3_probe_file(pair.lm, &model.lm_file, &model.lm_cfg, nullptr, &model.meta_errors);
     mm3_probe_file(pair.synth, &model.synth_file, nullptr, &model.synth_cfg, &model.meta_errors);
