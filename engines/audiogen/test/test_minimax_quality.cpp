@@ -14,6 +14,9 @@
 // DiT deterministic across repeated computes with interleaved CFG branches.
 //
 // Requires AUDIOGEN_TEST_MINIMAX_MODELS_DIR; exits 77 (ctest skip) otherwise.
+// With --q4 the model directory comes from AUDIOGEN_TEST_MINIMAX_Q4_MODELS_DIR
+// instead, so the same checks gate a quantized pair in a separate process
+// (the static LM/DiT graph caches are not rebuilt for a second in-process load).
 
 #include "minimax/backend.h"
 #include "minimax/logic.h"
@@ -22,6 +25,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -75,10 +79,12 @@ bool dit_is_deterministic_across_computes(const MM3Model & model, std::string * 
 
 }  // namespace
 
-int main() {
-    const char * models_dir = std::getenv("AUDIOGEN_TEST_MINIMAX_MODELS_DIR");
+int main(int argc, char ** argv) {
+    const bool   q4_run  = argc > 1 && std::strcmp(argv[1], "--q4") == 0;
+    const char * env_var = q4_run ? "AUDIOGEN_TEST_MINIMAX_Q4_MODELS_DIR" : "AUDIOGEN_TEST_MINIMAX_MODELS_DIR";
+    const char * models_dir = std::getenv(env_var);
     if (!models_dir || !*models_dir) {
-        std::fprintf(stderr, "SKIP set AUDIOGEN_TEST_MINIMAX_MODELS_DIR to run\n");
+        std::fprintf(stderr, "SKIP set %s to run\n", env_var);
         return 77;
     }
 

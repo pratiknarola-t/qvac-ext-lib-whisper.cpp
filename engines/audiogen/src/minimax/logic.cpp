@@ -201,7 +201,7 @@ std::string candidate_for_quant(const CandidateMap & candidates, const std::stri
 }
 
 ModelPair select_prioritized_pair(const CandidateMap & lm, const CandidateMap & synth) {
-    static const std::vector<std::string> priorities = {"q8_0", "f16", "bf16"};
+    static const std::vector<std::string> priorities = {"q8_0", "f16", "bf16", "q4_k_m", "q4_k_s"};
     for (const std::string & quant : priorities) {
         const std::string lm_path = candidate_for_quant(lm, quant);
         const std::string synth_path = candidate_for_quant(synth, quant);

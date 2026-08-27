@@ -170,6 +170,8 @@ struct MM3GenRequest {
 
     std::vector<std::vector<float>> forced_noise;
 
+    int64_t dump_iters = 0;
+
     bool keep_window_latents = false;
 
     std::function<bool()> should_cancel;
@@ -270,6 +272,7 @@ static bool mm3_prepare_ar_options(const MM3GenRequest & request, int64_t acoust
     options.max_frames = request.max_frames;
     options.seed = request.seed;
     options.collect_hiddens = true;
+    options.dump_iters = request.dump_iters;
     options.should_cancel = request.should_cancel;
     if (!request.forced_semantic.empty()) {
         const int64_t expected =

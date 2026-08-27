@@ -25,10 +25,12 @@ struct CliOptions {
     std::string semantic_path;
     std::string acoustic_path;
     std::vector<std::string> noise_paths;
+    std::string dump_dir;
     uint64_t seed = 0;
     int steps = 0;
     int64_t max_frames = 0;
     int threads = 0;
+    int64_t dump_iters = 0;
 };
 
 const char * arg_value(int argc, char ** argv, const char * name, const char * fallback) {
@@ -66,6 +68,8 @@ CliOptions parse_options(int argc, char ** argv) {
     options.steps         = atoi(arg_value(argc, argv, "--steps", "30"));
     options.max_frames    = atoll(arg_value(argc, argv, "--max-frames", "300"));
     options.threads       = atoi(arg_value(argc, argv, "--threads", "0"));
+    options.dump_iters    = atoll(arg_value(argc, argv, "--dump-iters", "0"));
+    options.dump_dir      = arg_value(argc, argv, "--dump-dir", options.out_dir.c_str());
     return options;
 }
 
@@ -78,7 +82,10 @@ void print_usage() {
             "  condcheck: verify the DiT emits byte-identical velocities across\n"
             "             repeated computes with interleaved CFG branches\n"
             "  common:    [--seed N] [--steps N] [--max-frames N] [--threads N]\n"
-            "             [--device cpu|gpu|auto]\n");
+            "             [--device cpu|gpu|auto]\n"
+            "             [--dump-iters N [--dump-dir <dir>]] write per-iteration AR\n"
+            "             probes (semantic logits, guided logits, hiddens, feedback)\n"
+            "             for the first N iterations as raw f32 files\n");
 }
 
 template <typename T>
@@ -154,6 +161,7 @@ MM3GenRequest build_base_request(const CliOptions & options, const MM3Model & mo
     request.max_frames = options.max_frames;
     request.cfg_flow = model.synth_cfg.flow.cfg_scale > 0 ? model.synth_cfg.flow.cfg_scale : 1.7f;
     request.keep_window_latents = true;
+    request.dump_iters = options.dump_iters;
     return request;
 }
 
@@ -210,6 +218,34 @@ bool write_artifacts(const std::string & out_dir, const MM3GenResult & result) {
                                 result.ar.acoustic_all.size());
 }
 
+bool write_ar_dump(const std::string & dir, size_t index, const MM3ArDump & dump) {
+    const std::string base = dir + "/ar-iter-" + std::to_string(index) + "-";
+    return mm3_replay_write_raw(base + "last-hidden.f32", dump.last_hidden.data(), dump.last_hidden.size()) &&
+           mm3_replay_write_raw(base + "sem-logits.f32", dump.sem_logits.data(), dump.sem_logits.size()) &&
+           mm3_replay_write_raw(base + "guided.f32", dump.guided.data(), dump.guided.size()) &&
+           mm3_replay_write_raw(base + "feedback.f32", dump.feedback.data(), dump.feedback.size()) &&
+           mm3_replay_write_raw(base + "depth-hidden.f32", dump.depth_hidden.data(), dump.depth_hidden.size());
+}
+
+bool write_ar_dumps(const CliOptions & options, const std::vector<MM3ArDump> & dumps) {
+    if (options.dump_iters <= 0) {
+        return true;
+    }
+    std::string error;
+    if (options.dump_dir != options.out_dir &&
+        !mm3_replay_prepare_output_dir(options.dump_dir, &error)) {
+        fprintf(stderr, "dump error: %s\n", error.c_str());
+        return false;
+    }
+    for (size_t index = 0; index < dumps.size(); ++index) {
+        if (!write_ar_dump(options.dump_dir, index, dumps[index])) {
+            return false;
+        }
+    }
+    fprintf(stderr, "[dump] %zu AR iterations under %s\n", dumps.size(), options.dump_dir.c_str());
+    return true;
+}
+
 void report_done(const MM3GenResult & result) {
     fprintf(stderr,
             "[done] frames=%lld windows=%lld samples=%lld peak=%.3f rms=%.4f "
@@ -231,6 +267,9 @@ int run_generation(const CliOptions & options, const MM3Model & model) {
     }
     if (!write_artifacts(options.out_dir, result)) {
         fprintf(stderr, "output error: cannot write artifacts under %s\n", options.out_dir.c_str());
+        return 1;
+    }
+    if (!write_ar_dumps(options, result.ar.dumps)) {
         return 1;
     }
     report_done(result);

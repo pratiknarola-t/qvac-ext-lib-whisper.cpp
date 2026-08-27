@@ -1702,6 +1702,46 @@ void test_quantize_policy() {
     CHECK(!quant_should_promote_f32(2));
 }
 
+// MM3's LM (arch "qwen3") uses llama.cpp-style tensor names, and its synth file
+// (arch "mm3") bundles a DiT with a condition encoder, RVQ depth decoder, vocoder,
+// and timestep Fourier basis that must stay untouched. Neither reuses the HF-style
+// v_proj/down_proj/o_proj bump machinery: MM3's own attn_v.weight/ffn_down.weight/
+// attn_output.weight names are shared verbatim between the LM and the (denylisted)
+// depth decoder, and the DiT's fused attn_qkv/ffn_in/ffn_out layout has no bump
+// target to protect, so quantization is flat aside from the embed/output-head
+// overrides checked here.
+void test_quantize_policy_mm3() {
+    using namespace tts_cpp::acestep;
+
+    const QuantVariant * q4km = find_quant_variant("q4_k_m");
+    CHECK(q4km != nullptr);
+
+    // LM embedding table and untied output head both take the embed type.
+    CHECK(quant_pick_type("token_embd.weight", 2, "qwen3", *q4km, 36) == GGML_TYPE_Q6_K);
+    CHECK(quant_pick_type("output.weight", 2, "qwen3", *q4km, 36) == GGML_TYPE_Q6_K);
+
+    // Everything else in the LM is flat base-type: no bump for MM3's naming.
+    CHECK(quant_pick_type("blk.0.attn_v.weight", 2, "qwen3", *q4km, 36) == GGML_TYPE_Q4_K);
+    CHECK(quant_pick_type("blk.35.ffn_down.weight", 2, "qwen3", *q4km, 36) == GGML_TYPE_Q4_K);
+    CHECK(quant_pick_type("blk.0.attn_output.weight", 2, "qwen3", *q4km, 36) == GGML_TYPE_Q4_K);
+
+    // The untied-output rule is scoped to "qwen3" only; it must not leak into ACE-Step's LM.
+    CHECK(quant_pick_type("output.weight", 2, "acestep-lm", *q4km, 24) == GGML_TYPE_Q4_K);
+
+    // Synth denylist: condition encoder, RVQ depth decoder, and vocoder never quantize.
+    CHECK(quant_pick_type("depth.proj.weight", 2, "mm3", *q4km, 0) == GGML_TYPE_COUNT);
+    CHECK(quant_pick_type("depth.blk.0.attn_v.weight", 2, "mm3", *q4km, 0) == GGML_TYPE_COUNT);
+    CHECK(quant_pick_type("cond.proj.weight", 3, "mm3", *q4km, 0) == GGML_TYPE_COUNT);
+    CHECK(quant_pick_type("voc.conv_in.weight", 3, "mm3", *q4km, 0) == GGML_TYPE_COUNT);
+    CHECK(quant_pick_type("dit.time_fourier.weight", 2, "mm3", *q4km, 0) == GGML_TYPE_COUNT);
+
+    // The DiT is the one synth component that quantizes, flat, including the
+    // attn_output.weight name it shares with the LM and the denylisted depth decoder.
+    CHECK(quant_pick_type("dit.blk.0.attn_qkv.weight", 2, "mm3", *q4km, 0) == GGML_TYPE_Q4_K);
+    CHECK(quant_pick_type("dit.proj_in.weight", 2, "mm3", *q4km, 0) == GGML_TYPE_Q4_K);
+    CHECK(quant_pick_type("dit.blk.0.attn_output.weight", 2, "mm3", *q4km, 0) == GGML_TYPE_Q4_K);
+}
+
 // End-to-end guard on the offset/padding planning and the streaming writer: a
 // regression there emits a byte-shifted GGUF that only fails at engine load.
 // Quantizes a synthetic BF16-era file and reads the result back through the
@@ -1813,6 +1853,90 @@ void test_quantize_gguf_roundtrip() {
         CHECK(q_odd && q_odd->type == GGML_TYPE_F32);
         if (q_odd) {
             CHECK(std::memcmp(q_odd->data, narrow.data(), narrow.size() * sizeof(float)) == 0);
+        }
+
+        gguf_free(out);
+        ggml_free(out_meta);
+    }
+
+    std::remove(in_path.c_str());
+    std::remove(out_path.c_str());
+}
+
+// Same end-to-end guard for the MM3 synth layout: the denylisted depth decoder
+// must pass through byte-identical while the DiT quantizes. A regression here
+// is silent (the file still loads) and only shows up as degraded audio.
+void test_quantize_gguf_roundtrip_mm3() {
+    using namespace tts_cpp::acestep;
+
+    const std::string in_path  = test_temp_dir() + "/qvac-mm3-quantize-in.gguf";
+    const std::string out_path = test_temp_dir() + "/qvac-mm3-quantize-out.gguf";
+
+    // 256-wide rows satisfy the k-quant superblock alignment, so only the
+    // policy (not the alignment fallback) decides who quantizes.
+    std::vector<float> row(256 * 2);
+    for (size_t i = 0; i < row.size(); ++i) {
+        row[i] = ((float) i - 256.0f) / 64.0f;
+    }
+
+    ggml_init_params ip{ 4 * 1024 * 1024, nullptr, /*no_alloc=*/false };
+    ggml_context *   ctx = ggml_init(ip);
+    gguf_context *   gc  = gguf_init_empty();
+    gguf_set_val_str(gc, "general.architecture", "mm3");
+
+    ggml_tensor * depth = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 256, 2);
+    ggml_set_name(depth, "depth.blk.0.attn_v.weight");
+    ggml_fp32_to_fp16_row(row.data(), (ggml_fp16_t *) depth->data, (int64_t) row.size());
+    gguf_add_tensor(gc, depth);
+    std::vector<ggml_fp16_t> depth_bytes((size_t) row.size());
+    std::memcpy(depth_bytes.data(), depth->data, row.size() * sizeof(ggml_fp16_t));
+
+    ggml_tensor * dit = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 256, 2);
+    ggml_set_name(dit, "dit.blk.0.attn_qkv.weight");
+    ggml_fp32_to_fp16_row(row.data(), (ggml_fp16_t *) dit->data, (int64_t) row.size());
+    gguf_add_tensor(gc, dit);
+
+    CHECK(gguf_write_to_file(gc, in_path.c_str(), /*only_meta=*/false));
+    gguf_free(gc);
+    ggml_free(ctx);
+
+    const QuantVariant * q4km = find_quant_variant("Q4_K_M");
+    QuantizeStats        stats;
+    std::string          error;
+    CHECK(quantize_gguf_file(in_path, out_path, *q4km, stats, error));
+    CHECK(error.empty());
+    CHECK(stats.n_tensors == 2);
+    CHECK(stats.n_quantized == 1);
+
+    ggml_context *   out_meta   = nullptr;
+    gguf_init_params out_params = { /*no_alloc=*/false, /*ctx=*/&out_meta };
+    gguf_context *   out        = gguf_init_from_file(out_path.c_str(), out_params);
+    CHECK(out != nullptr);
+    if (out) {
+        ggml_tensor * q_depth = ggml_get_tensor(out_meta, "depth.blk.0.attn_v.weight");
+        CHECK(q_depth && q_depth->type == GGML_TYPE_F16);
+        if (q_depth) {
+            CHECK(std::memcmp(q_depth->data, depth_bytes.data(),
+                              depth_bytes.size() * sizeof(ggml_fp16_t)) == 0);
+        }
+
+        ggml_tensor * q_dit = ggml_get_tensor(out_meta, "dit.blk.0.attn_qkv.weight");
+        CHECK(q_dit && q_dit->type == GGML_TYPE_Q4_K);
+        if (q_dit) {
+            // The writer must emit exactly ggml's reference quantization of the
+            // F32-converted source rows (ggml_quantize_chunk, no imatrix).
+            std::vector<float> f32(row.size());
+            ggml_fp16_to_fp32_row(depth_bytes.data(), f32.data(), (int64_t) f32.size());
+            std::vector<uint8_t> expected(ggml_row_size(GGML_TYPE_Q4_K, 256) * 2);
+            ggml_quantize_chunk(GGML_TYPE_Q4_K, f32.data(), expected.data(), 0, 2, 256, nullptr);
+            CHECK(std::memcmp(q_dit->data, expected.data(), expected.size()) == 0);
+
+            std::vector<float> back(row.size());
+            ggml_get_type_traits(GGML_TYPE_Q4_K)->to_float(q_dit->data, back.data(),
+                                                           (int64_t) back.size());
+            for (size_t i = 0; i < back.size(); ++i) {
+                CHECK(std::fabs(back[i] - row[i]) < 0.25f);
+            }
         }
 
         gguf_free(out);
@@ -2011,7 +2135,9 @@ int main() {
     test_wav_reader_mono_and_stereo();
     test_wav_reader_rejects_multichannel();
     test_quantize_policy();
+    test_quantize_policy_mm3();
     test_quantize_gguf_roundtrip();
+    test_quantize_gguf_roundtrip_mm3();
     test_bpe_utf8_codepoint();
     test_bpe_encode_merges();
     test_bpe_encode_byte_fallback();

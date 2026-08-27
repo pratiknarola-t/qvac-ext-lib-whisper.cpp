@@ -956,6 +956,26 @@ void test_model_pair_resolution() {
     fs::remove_all(root);
 }
 
+void test_model_pair_resolution_q4() {
+    namespace fs = std::filesystem;
+    using tts_cpp::minimax::detail::ModelPair;
+    using tts_cpp::minimax::detail::resolve_model_pair;
+    const fs::path root = fs::path("/tmp/tether") /
+                          ("minimax-model-pair-q4-" + std::to_string(std::random_device{}()));
+    fs::create_directories(root);
+    touch(root / "mm3-lm-q4_k_m.gguf");
+    touch(root / "mm3-synth-q4_k_m.gguf");
+    ModelPair q4_only = resolve_model_pair(root.string(), "", "");
+    CHECK(q4_only.quant == "q4_k_m");
+
+    touch(root / "mm3-lm-q8_0.gguf");
+    touch(root / "mm3-synth-q8_0.gguf");
+    ModelPair prefers_q8 = resolve_model_pair(root.string(), "", "");
+    CHECK(prefers_q8.quant == "q8_0");
+
+    fs::remove_all(root);
+}
+
 void test_backend_configuration() {
     using tts_cpp::minimax::detail::backend_configuration_matches;
     CHECK(backend_configuration_matches(0, 4, "first", 8, "second"));
@@ -1133,6 +1153,7 @@ int main() {
     test_pre_tokenization_branches();
     test_malformed_utf8();
     test_model_pair_resolution();
+    test_model_pair_resolution_q4();
     test_backend_configuration();
     test_device_configuration();
     test_device_backend_init();

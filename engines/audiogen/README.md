@@ -39,18 +39,19 @@ MiniMax uses two GGUF files: `mm3-lm-<quant>.gguf` for the Qwen3 global LM and
 `mm3-synth-<quant>.gguf` for the RVQ depth decoder, condition encoder, flow DiT,
 and vocoder. Set `EngineOptions::model_dir`, or provide `lm_model_path` and
 `synth_model_path` explicitly. Directory discovery matches quantized pairs
-case-insensitively, prefers `q8_0`, then `f16`, then `bf16`, and rejects
-duplicate candidates. The engine is desktop-only. It runs on CPU by default;
-`EngineOptions::device` (or, when that is empty, the `MM3_DEVICE` environment
-variable) accepts `cpu`, `gpu`, or `auto`. `gpu` requires a usable GPU backend
-and fails engine creation without one; `auto` takes a GPU when available and
-otherwise falls back to the CPU. On a GPU the weights and graphs live on the
-first usable backend the ggml registry offers (CUDA, Vulkan, Metal, ...) and a
-CPU backend backs any unsupported op; the full model pair must fit in device
-memory (~22 GB for the f16 pair). One MiniMax engine instance may be active at
-a time because its compute graphs are shared. The weight-free
-`test-minimax-metal-ops` regression compares the 4096-channel condition
-projection and every DAC transposed-convolution stride against CPU on Metal.
+case-insensitively, prefers `q8_0`, then `f16`, then `bf16`, then `q4_k_m`,
+then `q4_k_s`, and rejects duplicate candidates. The engine is desktop-only.
+It runs on CPU by default; `EngineOptions::device` (or, when that is empty,
+the `MM3_DEVICE` environment variable) accepts `cpu`, `gpu`, or `auto`. `gpu`
+requires a usable GPU backend and fails engine creation without one; `auto`
+takes a GPU when available and otherwise falls back to the CPU. On a GPU the
+weights and graphs live on the first usable backend the ggml registry offers
+(CUDA, Vulkan, Metal, ...) and a CPU backend backs any unsupported op; the
+full model pair must fit in device memory (~22 GB for the f16 pair). One
+MiniMax engine instance may be active at a time because its compute graphs
+are shared. The weight-free `test-minimax-metal-ops` regression compares the
+4096-channel condition projection and every DAC transposed-convolution
+stride against CPU on Metal.
 
 Vulkan and CUDA are the measured GPU backends, both on an RTX 5090. On each,
 `mm3-replay --mode replay` forcing the recorded official prompt tokens, codes,
@@ -84,6 +85,23 @@ local directory. The converter emits the two-file contract and writes the
 MiniMax-Music3 Community License identifier into both files. Ship the upstream
 model license with converted weights.
 
+For a smaller footprint, quantize the `f16` pair to `Q4_K_M` (or `Q4_K_S`) with
+`acestep-quantize` (built with `AUDIOGEN_BUILD_EXECUTABLES`, shared with the
+ACE-Step engine):
+
+```sh
+./build/engines/audiogen/acestep-quantize models/minimax/mm3-lm-f16.gguf \
+                                          models/minimax/mm3-lm-q4_k_m.gguf Q4_K_M
+./build/engines/audiogen/acestep-quantize models/minimax/mm3-synth-f16.gguf \
+                                          models/minimax/mm3-synth-q4_k_m.gguf Q4_K_M
+```
+
+This quantizes the LM and, within the synth file, the flow DiT; the condition
+encoder, RVQ depth decoder, and vocoder are left at their converted (F16/F32)
+precision. Quantize from the `f16` pair, not `q8_0` — `acestep-quantize` only
+requantizes BF16/F16/F32 source tensors, so an already-`q8_0` tensor passes
+through untouched.
+
 `mm3-replay` (built with `AUDIOGEN_BUILD_EXECUTABLES`) is the MiniMax CLI and
 parity harness:
 
@@ -98,11 +116,18 @@ replay` forces recorded prompt tokens, semantic/acoustic codes, and per-window
 initial noise through the native pipeline and dumps the per-window latents,
 frame hiddens, and stitched audio for 1:1 comparison against the official
 implementation, and `--mode condcheck` verifies the DiT emits byte-identical
-velocities across repeated computes. `test-minimax-quality` (built with
+velocities across repeated computes. `--dump-iters N` (optionally with
+`--dump-dir <dir>`) additionally writes the first N AR iterations' semantic
+logits, CFG-guided logits, LM hidden states, feedback embeddings, and depth
+hiddens as raw f32 files; because the LM and depth decoder still run under
+forced tokens, replay-mode dumps are teacher-forced and directly comparable
+across quantization levels and backends. `test-minimax-quality` (built with
 `AUDIOGEN_BUILD_TESTS`, skipped unless `AUDIOGEN_TEST_MINIMAX_MODELS_DIR` is
 set) is the model-backed regression: it asserts DiT determinism and that a
 short generation's final flow latents land on the learned data manifold
 instead of stalling near the Gaussian noise they started from.
+`test-minimax-quality-q4` runs the same checks against the pair named by
+`AUDIOGEN_TEST_MINIMAX_Q4_MODELS_DIR`.
 
 ### ACE-Step audio editing
 
