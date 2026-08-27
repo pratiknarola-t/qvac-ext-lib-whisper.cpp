@@ -323,6 +323,11 @@ static bool mm3_run_ar_stage(const MM3Model & model, const MM3GenRequest & reque
     if (static_cast<int64_t>(result->ar.frame_hiddens.size()) != expected) {
         return mm3_fail(error, "the AR stage returned a frame-hidden block of the wrong size");
     }
+    // The synth stages never touch the LM again; releasing its KV cache and
+    // sched compute buffers here frees a few hundred MiB before the DiT and
+    // vocoder allocate, which is what lets the whole pipeline fit a 10 GiB
+    // GPU. mm3_lm_prepare rebuilds everything on the next generation.
+    mm3_lm_free(&g_mm3_lm);
     return true;
 }
 
