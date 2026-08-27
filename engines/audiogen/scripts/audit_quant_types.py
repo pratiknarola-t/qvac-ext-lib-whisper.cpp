@@ -8,8 +8,9 @@ its size target or silently stayed mostly at source precision through the
 quantizer's block-size alignment fallback.
 
 The default deny-list covers the MM3 synth components that stay unquantized
-(depth decoder, condition encoder, vocoder, DiT timestep Fourier basis),
-using the tensor-name prefixes the converter actually writes.
+(condition encoder, vocoder, DiT timestep Fourier basis), using the
+tensor-name prefixes the converter actually writes. The depth decoder is not
+on it: the policy pins depth at Q8_0 in quantized synth files.
 
 usage: audit_quant_types.py in.gguf [deny_substr,deny_substr,...]
 Exit 0 and prints a per-type byte summary plus a deny-list violation list
@@ -19,7 +20,7 @@ import sys
 
 from gguf import GGUFReader
 
-DEFAULT_DENY = ["depth.", "cond.", "voc.", "time_fourier"]
+DEFAULT_DENY = ["cond.", "voc.", "time_fourier"]
 
 UNQUANTIZED_TYPES = {"F32", "F16", "BF16"}
 
