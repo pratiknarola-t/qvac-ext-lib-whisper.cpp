@@ -99,11 +99,13 @@ ACE-Step engine):
                                           models/minimax/mm3-synth-q4_k_m.gguf Q4_K_M
 ```
 
-This quantizes the LM and, within the synth file, the flow DiT; the condition
-encoder, RVQ depth decoder, and vocoder are left at their converted (F16/F32)
-precision. Quantize from the `f16` pair, not `q8_0` — `acestep-quantize` only
-requantizes BF16/F16/F32 source tensors, so an already-`q8_0` tensor passes
-through untouched.
+This quantizes the LM and, within the synth file, the flow DiT to the chosen
+k-quant while the RVQ depth decoder is held at `q8_0` (its per-frame matvec
+graphs need the integer fast path; F16 weights are several times slower on
+scalar-fp16 Vulkan devices) and the condition encoder and vocoder keep their
+converted (F16/F32) precision. Quantize from the `f16` pair, not `q8_0` —
+`acestep-quantize` only requantizes BF16/F16/F32 source tensors, so an
+already-`q8_0` tensor passes through untouched.
 
 `mm3-replay` (built with `AUDIOGEN_BUILD_EXECUTABLES`) is the MiniMax CLI and
 parity harness:

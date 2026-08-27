@@ -1728,9 +1728,12 @@ void test_quantize_policy_mm3() {
     // The untied-output rule is scoped to "qwen3" only; it must not leak into ACE-Step's LM.
     CHECK(quant_pick_type("output.weight", 2, "acestep-lm", *q4km, 24) == GGML_TYPE_Q4_K);
 
-    // Synth denylist: condition encoder, RVQ depth decoder, and vocoder never quantize.
-    CHECK(quant_pick_type("depth.proj.weight", 2, "mm3", *q4km, 0) == GGML_TYPE_COUNT);
-    CHECK(quant_pick_type("depth.blk.0.attn_v.weight", 2, "mm3", *q4km, 0) == GGML_TYPE_COUNT);
+    // Synth policy: condition encoder and vocoder never quantize; the RVQ depth
+    // decoder is pinned at Q8_0 for every variant (fast integer matvec path).
+    CHECK(quant_pick_type("depth.proj.weight", 2, "mm3", *q4km, 0) == GGML_TYPE_Q8_0);
+    CHECK(quant_pick_type("depth.blk.0.attn_v.weight", 2, "mm3", *q4km, 0) == GGML_TYPE_Q8_0);
+    CHECK(quant_pick_type("depth.audio_embd.weight", 2, "mm3", *q4km, 0) == GGML_TYPE_Q8_0);
+    CHECK(quant_pick_type("depth.blk.0.input_norm.weight", 1, "mm3", *q4km, 0) == GGML_TYPE_COUNT);
     CHECK(quant_pick_type("cond.proj.weight", 3, "mm3", *q4km, 0) == GGML_TYPE_COUNT);
     CHECK(quant_pick_type("voc.conv_in.weight", 3, "mm3", *q4km, 0) == GGML_TYPE_COUNT);
     CHECK(quant_pick_type("dit.time_fourier.weight", 2, "mm3", *q4km, 0) == GGML_TYPE_COUNT);
@@ -1863,9 +1866,10 @@ void test_quantize_gguf_roundtrip() {
     std::remove(out_path.c_str());
 }
 
-// Same end-to-end guard for the MM3 synth layout: the denylisted depth decoder
-// must pass through byte-identical while the DiT quantizes. A regression here
-// is silent (the file still loads) and only shows up as degraded audio.
+// Same end-to-end guard for the MM3 synth layout: the protected condition
+// encoder must pass through byte-identical, the depth decoder must land at
+// Q8_0, and the DiT takes the variant base type. A regression here is silent
+// (the file still loads) and only shows up as degraded audio.
 void test_quantize_gguf_roundtrip_mm3() {
     using namespace tts_cpp::acestep;
 
@@ -1883,6 +1887,13 @@ void test_quantize_gguf_roundtrip_mm3() {
     ggml_context *   ctx = ggml_init(ip);
     gguf_context *   gc  = gguf_init_empty();
     gguf_set_val_str(gc, "general.architecture", "mm3");
+
+    ggml_tensor * cond = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 256, 2);
+    ggml_set_name(cond, "cond.proj.weight");
+    ggml_fp32_to_fp16_row(row.data(), (ggml_fp16_t *) cond->data, (int64_t) row.size());
+    gguf_add_tensor(gc, cond);
+    std::vector<ggml_fp16_t> cond_bytes((size_t) row.size());
+    std::memcpy(cond_bytes.data(), cond->data, row.size() * sizeof(ggml_fp16_t));
 
     ggml_tensor * depth = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 256, 2);
     ggml_set_name(depth, "depth.blk.0.attn_v.weight");
@@ -1905,19 +1916,29 @@ void test_quantize_gguf_roundtrip_mm3() {
     std::string          error;
     CHECK(quantize_gguf_file(in_path, out_path, *q4km, stats, error));
     CHECK(error.empty());
-    CHECK(stats.n_tensors == 2);
-    CHECK(stats.n_quantized == 1);
+    CHECK(stats.n_tensors == 3);
+    CHECK(stats.n_quantized == 2);
 
     ggml_context *   out_meta   = nullptr;
     gguf_init_params out_params = { /*no_alloc=*/false, /*ctx=*/&out_meta };
     gguf_context *   out        = gguf_init_from_file(out_path.c_str(), out_params);
     CHECK(out != nullptr);
     if (out) {
+        ggml_tensor * q_cond = ggml_get_tensor(out_meta, "cond.proj.weight");
+        CHECK(q_cond && q_cond->type == GGML_TYPE_F16);
+        if (q_cond) {
+            CHECK(std::memcmp(q_cond->data, cond_bytes.data(),
+                              cond_bytes.size() * sizeof(ggml_fp16_t)) == 0);
+        }
+
         ggml_tensor * q_depth = ggml_get_tensor(out_meta, "depth.blk.0.attn_v.weight");
-        CHECK(q_depth && q_depth->type == GGML_TYPE_F16);
+        CHECK(q_depth && q_depth->type == GGML_TYPE_Q8_0);
         if (q_depth) {
-            CHECK(std::memcmp(q_depth->data, depth_bytes.data(),
-                              depth_bytes.size() * sizeof(ggml_fp16_t)) == 0);
+            std::vector<float> f32(row.size());
+            ggml_fp16_to_fp32_row(depth_bytes.data(), f32.data(), (int64_t) f32.size());
+            std::vector<uint8_t> expected(ggml_row_size(GGML_TYPE_Q8_0, 256) * 2);
+            ggml_quantize_chunk(GGML_TYPE_Q8_0, f32.data(), expected.data(), 0, 2, 256, nullptr);
+            CHECK(std::memcmp(q_depth->data, expected.data(), expected.size()) == 0);
         }
 
         ggml_tensor * q_dit = ggml_get_tensor(out_meta, "dit.blk.0.attn_qkv.weight");

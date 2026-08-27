@@ -99,13 +99,23 @@ inline bool quant_is_untied_output(const char * name, const char * arch) {
     return std::strcmp(arch, "qwen3") == 0 && std::strcmp(name, "output.weight") == 0;
 }
 
-// The MM3 synth bundle's condition encoder, RVQ depth decoder, and DAC vocoder stay
-// at their converted precision, as does the DiT's timestep Fourier basis (it only
-// survives today because ne[0]==1 fails the k-quant alignment check, which is not
-// guaranteed if that basis's shape ever changes); the DiT's other weights quantize.
+// The MM3 synth bundle's condition encoder and DAC vocoder stay at their
+// converted precision, as does the DiT's timestep Fourier basis (it only
+// survives today because ne[0]==1 fails the k-quant alignment check, which is
+// not guaranteed if that basis's shape ever changes); the DiT's other weights
+// quantize.
 inline bool quant_is_mm3_protected_component(const char * name) {
-    return std::strncmp(name, "depth.", 6) == 0 || std::strncmp(name, "cond.", 5) == 0 ||
-           std::strncmp(name, "voc.", 4) == 0 || std::strcmp(name, "dit.time_fourier.weight") == 0;
+    return std::strncmp(name, "cond.", 5) == 0 || std::strncmp(name, "voc.", 4) == 0 ||
+           std::strcmp(name, "dit.time_fourier.weight") == 0;
+}
+
+// The RVQ depth decoder is pinned at Q8_0 for every variant: its per-frame
+// step graphs are matvec-bound, and F16 weights fall onto slow scalar-fp16
+// paths on some Vulkan devices (6-12x per-frame cost on Strix RADV) while
+// doubling the bytes read; Q8_0 keeps the fast integer path and matches the
+// precision the shipped q8_0 pair already validated.
+inline bool quant_is_mm3_depth(const char * name, const char * arch) {
+    return std::strcmp(arch, "mm3") == 0 && std::strncmp(name, "depth.", 6) == 0;
 }
 
 inline bool quant_should_quantize(const char * name, int n_dims, const char * arch) {
@@ -154,6 +164,10 @@ inline enum ggml_type quant_pick_type(const char *         name,
                                       int                  n_layers) {
     if (!quant_should_quantize(name, n_dims, arch)) {
         return GGML_TYPE_COUNT;
+    }
+
+    if (quant_is_mm3_depth(name, arch)) {
+        return GGML_TYPE_Q8_0;
     }
 
     if ((quant_is_embed(name) || quant_is_untied_output(name, arch)) && !std::strstr(arch, "text-enc")) {

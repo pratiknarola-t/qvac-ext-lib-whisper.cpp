@@ -957,9 +957,9 @@ quantisation:
   You do not have to quantise here. Emitting f16 and running the existing
   `acestep-quantize` tool over mm3-lm-f16.gguf and mm3-synth-f16.gguf is the
   better-trodden path (it gives access to the k-quants this script does not
-  implement); acestep-quantize keeps the synth file's condition encoder, RVQ
-  depth decoder, and vocoder at their converted precision and only quantizes
-  the DiT.
+  implement); acestep-quantize quantizes the synth file's DiT, holds the RVQ
+  depth decoder at q8_0, and keeps the condition encoder and vocoder at their
+  converted precision.
 
 sources (--src may be repeated; directories are scanned recursively):
   preferred  Comfy-Org/MiniMax-Music-3     (single-file safetensors)
