@@ -39,9 +39,11 @@ MiniMax uses two GGUF files: `mm3-lm-<quant>.gguf` for the Qwen3 global LM and
 `mm3-synth-<quant>.gguf` for the RVQ depth decoder, condition encoder, flow DiT,
 and vocoder. Set `EngineOptions::model_dir`, or provide `lm_model_path` and
 `synth_model_path` explicitly. Directory discovery matches quantized pairs
-case-insensitively, prefers `q8_0`, then `f16`, then `bf16`, then `q4_k_m`,
-then `q4_k_s`, then `f32` (a dequantized diagnostic pair, only picked when
-nothing else matches), and rejects duplicate candidates. The engine is desktop-only.
+case-insensitively, prefers `q8_0`, then `f16`, then `bf16`, then the k-quant
+variants `acestep-quantize` can emit in descending fidelity (`q6_k`, `q5_k_m`,
+`q5_k_s`, `q4_k_m`, `q4_k_s`, `q3_k_l`, `q3_k_m`, `q3_k_s`, `q2_k`), then
+`f32` (a dequantized diagnostic pair, only picked when nothing else matches),
+and rejects duplicate candidates. The engine is desktop-only.
 It runs on CPU by default; `EngineOptions::device` (or, when that is empty,
 the `MM3_DEVICE` environment variable) accepts `cpu`, `gpu`, or `auto`. `gpu`
 requires a usable GPU backend and fails engine creation without one; `auto`

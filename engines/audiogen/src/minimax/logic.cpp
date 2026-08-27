@@ -201,9 +201,14 @@ std::string candidate_for_quant(const CandidateMap & candidates, const std::stri
 }
 
 ModelPair select_prioritized_pair(const CandidateMap & lm, const CandidateMap & synth) {
-    // f32 sits last: a dequantized-to-F32 pair (scripts/dequant_gguf.py) is a
-    // diagnostic reference, only picked when nothing production-shaped exists.
-    static const std::vector<std::string> priorities = {"q8_0", "f16", "bf16", "q4_k_m", "q4_k_s", "f32"};
+    // Every variant acestep-quantize can emit, best fidelity first after the
+    // established q8_0 > f16 > bf16 head. f32 sits last: a dequantized-to-F32
+    // pair (scripts/dequant_gguf.py) is a diagnostic reference, only picked
+    // when nothing production-shaped exists.
+    static const std::vector<std::string> priorities = {"q8_0",   "f16",    "bf16",   "q6_k",
+                                                        "q5_k_m", "q5_k_s", "q4_k_m", "q4_k_s",
+                                                        "q3_k_l", "q3_k_m", "q3_k_s", "q2_k",
+                                                        "f32"};
     for (const std::string & quant : priorities) {
         const std::string lm_path = candidate_for_quant(lm, quant);
         const std::string synth_path = candidate_for_quant(synth, quant);

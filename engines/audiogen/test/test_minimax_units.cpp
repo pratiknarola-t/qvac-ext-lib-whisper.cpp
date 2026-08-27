@@ -993,6 +993,16 @@ void test_model_pair_resolution_f32() {
     ModelPair prefers_q4 = resolve_model_pair(root.string(), "", "");
     CHECK(prefers_q4.quant == "q4_k_m");
 
+    touch(root / "mm3-lm-q6_k.gguf");
+    touch(root / "mm3-synth-q6_k.gguf");
+    ModelPair prefers_q6 = resolve_model_pair(root.string(), "", "");
+    CHECK(prefers_q6.quant == "q6_k");
+
+    touch(root / "mm3-lm-q8_0.gguf");
+    touch(root / "mm3-synth-q8_0.gguf");
+    ModelPair prefers_q8 = resolve_model_pair(root.string(), "", "");
+    CHECK(prefers_q8.quant == "q8_0");
+
     fs::remove_all(root);
 }
 
