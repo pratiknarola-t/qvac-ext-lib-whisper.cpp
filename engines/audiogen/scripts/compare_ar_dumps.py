@@ -68,13 +68,25 @@ def count_iterations(dump_dir):
 
 
 def cosine(a, b):
-    a, b = a.astype(np.float64), b.astype(np.float64)
-    norm_a, norm_b = np.linalg.norm(a), np.linalg.norm(b)
+    """Cosine over the elementwise-both-finite subset, plus the fraction of
+    positions that subset covers. `guided` carries -inf entries from top-k
+    masking (and two runs need not mask the exact same indices, so the
+    finite fraction is itself a signal: how much the two runs' top-k sets
+    overlap, not just their relative order). Returns (cosine, finite_fraction);
+    cosine is None only when no position is finite on both sides -- that is
+    reported as missing, not silently coerced to a number."""
+    finite = np.isfinite(a) & np.isfinite(b)
+    finite_fraction = float(np.mean(finite)) if a.size else 0.0
+    if not np.any(finite):
+        return None, finite_fraction
+
+    a_f, b_f = a[finite].astype(np.float64), b[finite].astype(np.float64)
+    norm_a, norm_b = np.linalg.norm(a_f), np.linalg.norm(b_f)
     if norm_a == 0.0 and norm_b == 0.0:
-        return 1.0
+        return 1.0, finite_fraction
     if norm_a == 0.0 or norm_b == 0.0:
-        return 0.0
-    return float(a @ b / (norm_a * norm_b))
+        return 0.0, finite_fraction
+    return float(a_f @ b_f / (norm_a * norm_b)), finite_fraction
 
 
 def conditional_half(sem_logits):
@@ -110,16 +122,21 @@ def compare_iteration(ref_dir, cand_dir, iteration, field_cosines, argmax_accum)
     per_field_cosine = {}
     for field in FIELDS:
         ref, cand = compare_field_at_iteration(ref_dir, cand_dir, iteration, field)
-        value = cosine(ref, cand)
-        field_cosines[field].append(value)
-        per_field_cosine[field] = value
+        cosine_value, finite_fraction = cosine(ref, cand)
+        field_cosines[field].append({"cosine": cosine_value, "finite_fraction": finite_fraction})
+        per_field_cosine[field] = cosine_value
 
+        # argmax/top-k are valid on masked (-inf-containing) vectors as-is --
+        # np.argmax/np.argsort naturally rank -inf entries lowest, matching
+        # what the sampler itself would see -- so these run on the raw
+        # vectors, unlike cosine which needs the finite-both subset.
         if field == "guided":
             argmax_accum["guided"].append(argmax_stat(ref, cand))
         elif field == "sem-logits":
             argmax_accum["sem-logits"].append(argmax_stat(conditional_half(ref), conditional_half(cand)))
 
-    return min(per_field_cosine.values())
+    comparable = [value for value in per_field_cosine.values() if value is not None]
+    return min(comparable) if comparable else None
 
 
 def compare(ref_dir, cand_dir, n_iterations):
@@ -133,12 +150,30 @@ def compare(ref_dir, cand_dir, n_iterations):
     return field_cosines, argmax_accum, per_iteration_min
 
 
-def summarize_field(cosines):
+def summarize_field(entries):
+    """entries[i] = {"cosine": float|None, "finite_fraction": float} for
+    iteration i. Cosine stats are computed only over iterations that had a
+    comparable (finite-on-both-sides) subset; worst_iteration still refers
+    to the original iteration index, not a position in the filtered list."""
+    n = len(entries)
+    comparable = [(i, e["cosine"]) for i, e in enumerate(entries) if e["cosine"] is not None]
+    mean_finite_fraction = float(np.mean([e["finite_fraction"] for e in entries])) if n else 0.0
+
+    if not comparable:
+        return {
+            "n": n, "n_comparable": 0, "mean_cosine": None, "min_cosine": None,
+            "worst_iteration": None, "mean_finite_fraction": mean_finite_fraction,
+        }
+
+    cosines_only = [c for _, c in comparable]
+    worst_iteration, min_cosine = comparable[int(np.argmin(cosines_only))]
     return {
-        "n": len(cosines),
-        "mean_cosine": float(np.mean(cosines)),
-        "min_cosine": float(np.min(cosines)),
-        "worst_iteration": int(np.argmin(cosines)),
+        "n": n,
+        "n_comparable": len(comparable),
+        "mean_cosine": float(np.mean(cosines_only)),
+        "min_cosine": float(min_cosine),
+        "worst_iteration": int(worst_iteration),
+        "mean_finite_fraction": mean_finite_fraction,
     }
 
 
@@ -155,11 +190,17 @@ def summarize_argmax(entries):
 
 
 def build_summary(field_cosines, argmax_accum, per_iteration_min):
+    comparable = [(i, v) for i, v in enumerate(per_iteration_min) if v is not None]
+    if comparable:
+        overall_worst_iteration, overall_worst_min_cosine = min(comparable, key=lambda pair: pair[1])
+    else:
+        overall_worst_iteration, overall_worst_min_cosine = None, None
+
     return {
-        "fields": {field: summarize_field(cosines) for field, cosines in field_cosines.items()},
+        "fields": {field: summarize_field(entries) for field, entries in field_cosines.items()},
         "argmax": {name: summarize_argmax(entries) for name, entries in argmax_accum.items()},
-        "overall_worst_iteration": int(np.argmin(per_iteration_min)),
-        "overall_worst_min_cosine": float(np.min(per_iteration_min)),
+        "overall_worst_iteration": overall_worst_iteration,
+        "overall_worst_min_cosine": overall_worst_min_cosine,
     }
 
 
@@ -167,7 +208,9 @@ def apply_gates(summary, min_cosine, min_argmax_agree):
     violations = []
     if min_cosine is not None:
         for field, stats in summary["fields"].items():
-            if stats["min_cosine"] < min_cosine:
+            if stats["min_cosine"] is None:
+                violations.append(f"{field}: no comparable (finite-on-both-sides) position in any iteration")
+            elif stats["min_cosine"] < min_cosine:
                 violations.append(
                     f"{field}: min_cosine {stats['min_cosine']:.6f} < {min_cosine} "
                     f"(worst at iteration {stats['worst_iteration']})"
@@ -181,19 +224,31 @@ def apply_gates(summary, min_cosine, min_argmax_agree):
     return violations
 
 
+def fmt_float(value, spec=".6f"):
+    return format(value, spec) if value is not None else "n/a"
+
+
+def fmt_int(value):
+    return str(value) if value is not None else "n/a"
+
+
 def print_summary(summary, n_iterations):
     print(f"compared {n_iterations} iteration(s)\n")
-    print(f"{'field':<14}{'n':>6}{'mean_cosine':>14}{'min_cosine':>14}{'worst_iter':>12}")
+    print(f"{'field':<14}{'n':>6}{'n_cmp':>7}{'mean_cosine':>14}{'min_cosine':>14}{'worst_iter':>12}{'finite%':>10}")
     for field, stats in summary["fields"].items():
-        print(f"{field:<14}{stats['n']:>6}{stats['mean_cosine']:>14.6f}{stats['min_cosine']:>14.6f}"
-              f"{stats['worst_iteration']:>12}")
+        print(f"{field:<14}{stats['n']:>6}{stats['n_comparable']:>7}"
+              f"{fmt_float(stats['mean_cosine']):>14}{fmt_float(stats['min_cosine']):>14}"
+              f"{fmt_int(stats['worst_iteration']):>12}{stats['mean_finite_fraction']:>9.1%}")
 
     print(f"\n{'argmax':<26}{'n':>6}{'agree_pct':>12}{'mean_top8_overlap':>20}")
     for name, stats in summary["argmax"].items():
         print(f"{name:<26}{stats['n']:>6}{stats['argmax_agree_pct']:>11.2f}%{stats['mean_top_k_overlap']:>19.2f}")
 
-    print(f"\noverall worst iteration: {summary['overall_worst_iteration']} "
-          f"(min cosine {summary['overall_worst_min_cosine']:.6f} across all fields at that iteration)")
+    if summary["overall_worst_iteration"] is None:
+        print("\noverall worst iteration: n/a (no field had a comparable position in any iteration)")
+    else:
+        print(f"\noverall worst iteration: {summary['overall_worst_iteration']} "
+              f"(min cosine {summary['overall_worst_min_cosine']:.6f} across all fields at that iteration)")
 
     if summary["violations"]:
         print(f"\nGATE: FAIL ({len(summary['violations'])} violation(s))")
