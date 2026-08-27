@@ -52,6 +52,35 @@ double latent_std(const std::vector<float> & latents) {
     return std::sqrt(sum_sq / (double) latents.size() - mean * mean);
 }
 
+// The tiled vocoder decode must be bit-identical to a single-shot decode:
+// MM3_VOC_OVERLAP frames of context exceed the conv stack's receptive field,
+// so every tile interior reproduces the full-length computation exactly.
+bool vocoder_tiling_is_bit_exact(const MM3Model & model, std::string * error) {
+    const int64_t L  = (int64_t) model.synth_cfg.dit.window_latents;
+    const int64_t FC = (int64_t) model.synth_cfg.voc.fold_channels;
+    if (L <= MM3_VOC_CHUNK) {
+        *error = "window_latents does not exercise the tiled path";
+        return false;
+    }
+    std::vector<float> latents;
+    tts_cpp::minimax::detail::fill_noise(11, 0, latents, L * 2 * FC);
+
+    std::vector<float> single, tiled;
+    const int64_t T = L * (int64_t) model.synth_cfg.voc.total_upsample;
+    single.assign((size_t) (2 * T), 0.0f);
+    tiled.assign((size_t) (2 * T), 0.0f);
+    if (!mm3_vocoder_prepare(model, &g_mm3_voc, error) ||
+        !mm3_vocoder_decode_tiled(model, latents, L, single, L, MM3_VOC_OVERLAP, error) ||
+        !mm3_vocoder_decode_tiled(model, latents, L, tiled, MM3_VOC_CHUNK, MM3_VOC_OVERLAP, error)) {
+        return false;
+    }
+    if (std::memcmp(single.data(), tiled.data(), single.size() * sizeof(float)) != 0) {
+        *error = "tiled vocoder output differs from single-shot output";
+        return false;
+    }
+    return true;
+}
+
 bool dit_is_deterministic_across_computes(const MM3Model & model, std::string * error) {
     const int64_t L = 64;
     const int64_t N = (int64_t) model.synth_cfg.dit.in_channels * L;
@@ -106,6 +135,11 @@ int main(int argc, char ** argv) {
 
     if (!dit_is_deterministic_across_computes(model, &error)) {
         std::fprintf(stderr, "FAIL dit determinism: %s\n", error.c_str());
+        ++failures;
+    }
+
+    if (!vocoder_tiling_is_bit_exact(model, &error)) {
+        std::fprintf(stderr, "FAIL vocoder tiling: %s\n", error.c_str());
         ++failures;
     }
 
