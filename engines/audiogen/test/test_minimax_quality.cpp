@@ -128,6 +128,7 @@ int main(int argc, char ** argv) {
     CHECK(result.frames > 0);
     CHECK(result.n_windows == 1);
     CHECK(result.n_samples > 0);
+    CHECK(!result.ids_cond_used.empty());
     CHECK(!result.has_nan);
     CHECK(result.peak > 0.005f);
     CHECK(result.rms > 0.001);

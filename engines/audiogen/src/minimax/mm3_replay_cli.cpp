@@ -210,6 +210,8 @@ bool write_artifacts(const std::string & out_dir, const MM3GenResult & result) {
     return mm3_replay_write_wav(out_dir + "/audio.wav", result.audio, result.n_samples,
                                 result.sample_rate) &&
            write_window_latents(out_dir, result.window_latents) &&
+           mm3_replay_write_raw(out_dir + "/tokens.i32", result.ids_cond_used.data(),
+                                result.ids_cond_used.size()) &&
            mm3_replay_write_raw(out_dir + "/frame-hiddens.f32", result.ar.frame_hiddens.data(),
                                 result.ar.frame_hiddens.size()) &&
            mm3_replay_write_raw(out_dir + "/semantic.i32", result.ar.semantic_all.data(),

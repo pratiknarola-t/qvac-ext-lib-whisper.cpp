@@ -190,6 +190,10 @@ struct MM3GenResult {
     std::vector<int64_t> window_overlap;
     std::vector<int64_t> forced_noise_used;
 
+    // The conditional prompt ids the run actually used (tokenized from the
+    // prompt when ids_cond was empty), so a full run records the replay input.
+    std::vector<int32_t> ids_cond_used;
+
     std::vector<std::vector<float>> window_latents;
 
     MM3ArResult ar;
@@ -478,6 +482,7 @@ static bool mm3_generate(const MM3Model & model, const MM3GenRequest & request,
     if (!mm3_prepare_token_ids(model, request, tokenizer, conditional, unconditional, error)) {
         return false;
     }
+    result->ids_cond_used = conditional;
     if (!mm3_run_ar_stage(model, request, dimensions, conditional, unconditional,
                           progress, result, error)) {
         return false;

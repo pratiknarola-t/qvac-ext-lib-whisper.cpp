@@ -111,12 +111,14 @@ parity harness:
                                     --lyrics "[Instrumental]" --max-frames 300
 ```
 
-`--mode full` runs the pipeline from a caption/lyrics pair, `--mode
-replay` forces recorded prompt tokens, semantic/acoustic codes, and per-window
-initial noise through the native pipeline and dumps the per-window latents,
-frame hiddens, and stitched audio for 1:1 comparison against the official
-implementation, and `--mode condcheck` verifies the DiT emits byte-identical
-velocities across repeated computes. `--dump-iters N` (optionally with
+`--mode full` runs the pipeline from a caption/lyrics pair and records the
+prompt token ids it used (`tokens.i32`) next to the emitted semantic/acoustic
+codes, so a full run's output directory doubles as a replay input set.
+`--mode replay` forces recorded prompt tokens, semantic/acoustic codes, and
+per-window initial noise through the native pipeline and dumps the per-window
+latents, frame hiddens, and stitched audio for 1:1 comparison against the
+official implementation, and `--mode condcheck` verifies the DiT emits
+byte-identical velocities across repeated computes. `--dump-iters N` (optionally with
 `--dump-dir <dir>`) additionally writes the first N AR iterations' semantic
 logits, CFG-guided logits, LM hidden states, feedback embeddings, and depth
 hiddens as raw f32 files; because the LM and depth decoder still run under
