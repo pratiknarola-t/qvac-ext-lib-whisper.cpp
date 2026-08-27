@@ -106,14 +106,16 @@ inline bool quant_is_untied_output(const char * name, const char * arch) {
 // quantize.
 inline bool quant_is_mm3_protected_component(const char * name) {
     return std::strncmp(name, "cond.", 5) == 0 || std::strncmp(name, "voc.", 4) == 0 ||
-           std::strcmp(name, "dit.time_fourier.weight") == 0;
+           std::strcmp(name, "dit.time_fourier.weight") == 0 ||
+           std::strcmp(name, "depth.pos_embd.weight") == 0;
 }
 
 // The RVQ depth decoder is pinned at Q8_0 for every variant: its per-frame
 // step graphs are matvec-bound, and F16 weights fall onto slow scalar-fp16
 // paths on some Vulkan devices (6-12x per-frame cost on Strix RADV) while
 // doubling the bytes read; Q8_0 keeps the fast integer path and matches the
-// precision the shipped q8_0 pair already validated.
+// precision the shipped q8_0 pair already validated. depth.pos_embd.weight
+// stays F32 (protected above): the depth graph views into it raw.
 inline bool quant_is_mm3_depth(const char * name, const char * arch) {
     return std::strcmp(arch, "mm3") == 0 && std::strncmp(name, "depth.", 6) == 0;
 }

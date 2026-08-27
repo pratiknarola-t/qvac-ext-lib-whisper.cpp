@@ -1734,6 +1734,7 @@ void test_quantize_policy_mm3() {
     CHECK(quant_pick_type("depth.blk.0.attn_v.weight", 2, "mm3", *q4km, 0) == GGML_TYPE_Q8_0);
     CHECK(quant_pick_type("depth.audio_embd.weight", 2, "mm3", *q4km, 0) == GGML_TYPE_Q8_0);
     CHECK(quant_pick_type("depth.blk.0.input_norm.weight", 1, "mm3", *q4km, 0) == GGML_TYPE_COUNT);
+    CHECK(quant_pick_type("depth.pos_embd.weight", 2, "mm3", *q4km, 0) == GGML_TYPE_COUNT);
     CHECK(quant_pick_type("cond.proj.weight", 3, "mm3", *q4km, 0) == GGML_TYPE_COUNT);
     CHECK(quant_pick_type("voc.conv_in.weight", 3, "mm3", *q4km, 0) == GGML_TYPE_COUNT);
     CHECK(quant_pick_type("dit.time_fourier.weight", 2, "mm3", *q4km, 0) == GGML_TYPE_COUNT);
