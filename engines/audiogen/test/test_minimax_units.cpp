@@ -1,6 +1,7 @@
 #include "minimax/logic.h"
 #include "minimax/backend.h"
 #include "minimax/bpe.h"
+#include "minimax/mm3-flash-attn.h"
 #include "minimax/mm3-flow-runtime.h"
 #include "minimax/mm3-replay-io.h"
 #include "minimax/mm3-window-orchestrator.h"
@@ -1195,6 +1196,34 @@ void test_device_backend_init() {
     backend_configure_device("cpu");
 }
 
+void test_flash_attn_policy() {
+    CHECK(!mm3_use_flash_attn(false, false, "MM3_LM_NO_FLASH", "MM3_LM_FLASH"));
+    CHECK(!mm3_use_flash_attn(false, true, "MM3_DIT_NO_FLASH", nullptr));
+
+    set_env("MM3_LM_NO_FLASH", nullptr);
+    set_env("MM3_LM_FLASH", nullptr);
+    set_env("MM3_DIT_NO_FLASH", nullptr);
+
+    CHECK(!mm3_use_flash_attn(true, false, "MM3_LM_NO_FLASH", "MM3_LM_FLASH"));
+    CHECK(mm3_use_flash_attn(true, true, "MM3_DIT_NO_FLASH", nullptr));
+
+    set_env("MM3_LM_FLASH", "1");
+    CHECK(mm3_use_flash_attn(true, false, "MM3_LM_NO_FLASH", "MM3_LM_FLASH"));
+
+    set_env("MM3_LM_NO_FLASH", "1");
+    CHECK(!mm3_use_flash_attn(true, false, "MM3_LM_NO_FLASH", "MM3_LM_FLASH"));
+
+    set_env("MM3_DIT_NO_FLASH", "1");
+    CHECK(!mm3_use_flash_attn(true, true, "MM3_DIT_NO_FLASH", nullptr));
+
+    set_env("MM3_DIT_NO_FLASH", "0");
+    CHECK(mm3_use_flash_attn(true, true, "MM3_DIT_NO_FLASH", nullptr));
+
+    set_env("MM3_LM_NO_FLASH", nullptr);
+    set_env("MM3_LM_FLASH", nullptr);
+    set_env("MM3_DIT_NO_FLASH", nullptr);
+}
+
 void test_replay_io() {
     namespace fs = std::filesystem;
     const fs::path dir = fs::temp_directory_path() / "mm3-replay-io-test";
@@ -1312,6 +1341,7 @@ int main() {
     test_backend_configuration();
     test_device_configuration();
     test_device_backend_init();
+    test_flash_attn_policy();
     test_replay_io();
     test_engine_instance_limit();
     test_cancellation();

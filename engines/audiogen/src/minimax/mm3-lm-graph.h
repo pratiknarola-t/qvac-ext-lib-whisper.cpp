@@ -4,13 +4,12 @@
 
 #include "backend.h"
 #include "ggml.h"
-#include "build-flags.h"
+#include "mm3-flash-attn.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -367,10 +366,10 @@ static bool mm3_lm_prepare(const MM3Model & m, MM3LmGraph * g, int64_t n_ctx_nee
         g->cpu_backend = bp.cpu_backend;
         g->backend_ref = true;
 
-        const char * no_fa = std::getenv("MM3_LM_NO_FLASH");
-        g->use_flash_attn  = bp.has_gpu && !HOT_STEP_FA_DISABLED && !(no_fa && no_fa[0] && no_fa[0] != '0');
-        g->lm_token        = lt;
-        g->synth_token     = st;
+        g->use_flash_attn =
+            mm3_use_flash_attn(bp.has_gpu, /*default_on=*/false, "MM3_LM_NO_FLASH", "MM3_LM_FLASH");
+        g->lm_token    = lt;
+        g->synth_token = st;
     }
 
     if (g->n_ctx >= want) {

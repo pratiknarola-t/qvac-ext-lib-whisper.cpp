@@ -57,10 +57,14 @@ vocoder decodes in overlapped tiles whose interiors are bit-identical to a
 single-shot decode, so the `q4_k_m` pair completes full generations on a
 10 GiB GPU (RTX 3080, peak 9.4 GiB alongside a desktop) and on a 16 GB
 Apple-silicon Mac over Metal (peak RSS 8.4 GiB), both of which the `q8_0`
-pair cannot fit. One MiniMax engine instance may be active at a time because
-its compute graphs are shared. The weight-free `test-minimax-metal-ops`
-regression compares the 4096-channel condition projection and every DAC
-transposed-convolution stride against CPU on Metal.
+pair cannot fit. The flow DiT runs with flash attention by default on a GPU
+backend (off on CPU); set `MM3_DIT_NO_FLASH=1` to force it off. The LM keeps
+non-flash attention by default because flash attention drifts its sampled
+logits; set `MM3_LM_FLASH=1` to opt it in on a GPU, or `MM3_LM_NO_FLASH=1` to
+force it off (this wins if both are set). One MiniMax engine instance may be
+active at a time because its compute graphs are shared. The weight-free
+`test-minimax-metal-ops` regression compares the 4096-channel condition
+projection and every DAC transposed-convolution stride against CPU on Metal.
 
 Vulkan and CUDA are the measured GPU backends at `q8_0`/`f16`, both on an RTX
 5090. On each, `mm3-replay --mode replay` forcing the recorded official prompt
