@@ -50,24 +50,37 @@ requires a usable GPU backend and fails engine creation without one; `auto`
 takes a GPU when available and otherwise falls back to the CPU. On a GPU the
 weights and graphs live on the first usable backend the ggml registry offers
 (CUDA, Vulkan, Metal, ...) and a CPU backend backs any unsupported op; the
-full model pair must fit in device memory (~22 GB for the f16 pair). One
-MiniMax engine instance may be active at a time because its compute graphs
-are shared. The weight-free `test-minimax-metal-ops` regression compares the
-4096-channel condition projection and every DAC transposed-convolution
-stride against CPU on Metal.
+full model pair must fit in device memory (~22 GB for the f16 pair, 12.7 GB
+for `q8_0`, 7.6 GB for `q4_k_m`). The LM's KV cache and compute buffers are
+released after the AR stage and rebuilt on the next generation, and the
+vocoder decodes in overlapped tiles whose interiors are bit-identical to a
+single-shot decode, so the `q4_k_m` pair completes full generations on a
+10 GiB GPU (RTX 3080, peak 9.4 GiB alongside a desktop) and on a 16 GB
+Apple-silicon Mac over Metal (peak RSS 8.4 GiB), both of which the `q8_0`
+pair cannot fit. One MiniMax engine instance may be active at a time because
+its compute graphs are shared. The weight-free `test-minimax-metal-ops`
+regression compares the 4096-channel condition projection and every DAC
+transposed-convolution stride against CPU on Metal.
 
-Vulkan and CUDA are the measured GPU backends, both on an RTX 5090. On each,
-`mm3-replay --mode replay` forcing the recorded official prompt tokens, codes,
-and noise reproduces the CPU rendering (time-domain audio correlation 0.9998
-on Vulkan, 0.9993 on CUDA), `--mode condcheck` confirms byte-identical DiT
-velocities across repeated computes, and `test-minimax-quality` lands the
-final flow latents on the learned manifold. Vulkan is measured with both the
-`q8_0` and the `f16` pair; the 22 GB `f16` pair far exceeds ggml's 1 GiB
-Vulkan suballocation block and loads through the chunked device buffers ggml
-creates automatically. The full `test-backend-ops` suite passes on the same
-device, including the `b_absmax=1e5` LM-shaped `mul_mat` stress cases.
-Metal and OpenCL remain unmeasured for MiniMax and take the same all-on-GPU
-placement, so measure them the same way before shipping them.
+Vulkan and CUDA are the measured GPU backends at `q8_0`/`f16`, both on an RTX
+5090. On each, `mm3-replay --mode replay` forcing the recorded official prompt
+tokens, codes, and noise reproduces the CPU rendering (time-domain audio
+correlation 0.9998 on Vulkan, 0.9993 on CUDA), `--mode condcheck` confirms
+byte-identical DiT velocities across repeated computes, and
+`test-minimax-quality` lands the final flow latents on the learned manifold.
+Vulkan is measured with both the `q8_0` and the `f16` pair; the 22 GB `f16`
+pair far exceeds ggml's 1 GiB Vulkan suballocation block and loads through the
+chunked device buffers ggml creates automatically. The full
+`test-backend-ops` suite passes on the same device, including the
+`b_absmax=1e5` LM-shaped `mul_mat` stress cases. The `q4_k_m` pair is
+measured on CPU, Metal (M5), Vulkan (Strix Halo RADV and RTX 3080), and CUDA
+(RTX 3080): teacher-forced replays of the same inputs agree with the
+F32-dequantized reference at 0.97 waveform correlation on every backend
+(the `q8_0` pair's own figure on the same probe is 0.9995), condcheck stays
+byte-identical, and `q4_k_m` generates faster than `q8_0` (Strix Vulkan
+94.7 s vs 105.5 s, CPU 397 s vs 471 s for the same 12 s clip). OpenCL
+remains unmeasured for MiniMax and takes the same all-on-GPU placement, so
+measure it the same way before shipping it.
 
 The frame rate, maximum frame count, flow defaults, and output sample rate come
 from GGUF metadata. Current converted files specify 25 frames per second, at
