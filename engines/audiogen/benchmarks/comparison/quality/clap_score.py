@@ -74,7 +74,10 @@ def resample_to (waveform: Any, orig_rate: int, target_rate: int) -> Any:
 def score_waveform (model: Any, processor: Any, waveform: Any, sample_rate: int, text: str, device: str) -> float:
     import torch
 
-    text_inputs = processor(text=[text], return_tensors='pt', padding=True)
+    # CLAP's text tower is RoBERTa-based with a 512-token limit; an untruncated
+    # long caption+lyrics prompt indexes past the position-embedding table
+    # instead of erroring cleanly, so truncation must be requested explicitly.
+    text_inputs = processor(text=[text], return_tensors='pt', padding=True, truncation=True)
     audio_inputs = processor(
         audio=[waveform],
         sampling_rate=sample_rate,
@@ -96,11 +99,13 @@ def score_waveform (model: Any, processor: Any, waveform: Any, sample_rate: int,
     return float(score.item())
 
 
-def score_item (model: Any, processor: Any, item: dict[str, Any], device: str) -> dict[str, Any]:
+def score_item (model: Any, processor: Any, item: dict[str, Any], device: str,
+                 default_seed: int | None) -> dict[str, Any]:
     started = time.perf_counter()
     wav_path = item.get('wav')
     text = item.get('text')
     item_id = item.get('id')
+    seed = item.get('seed', default_seed)
     if not wav_path or not text:
         return {'id': item_id, 'ok': False, 'score': None, 'error': 'item needs wav and text', 'elapsedMs': 0}
     try:
@@ -109,6 +114,15 @@ def score_item (model: Any, processor: Any, item: dict[str, Any], device: str) -
         if sample_rate != target_rate:
             waveform = resample_to(waveform, sample_rate, target_rate)
             sample_rate = target_rate
+        if seed is not None:
+            # ClapFeatureExtractor's default truncation="rand_trunc" picks a
+            # random 10s crop (via the numpy global RNG) for any audio longer
+            # than its window, so an unseeded score for a >10s clip is not
+            # reproducible run to run. Reseed right before the call that
+            # consumes it so a given (seed, item) pair always crops the same
+            # window, without affecting other items' RNG draws.
+            import numpy as np
+            np.random.seed(seed)
         score = score_waveform(model, processor, waveform, sample_rate, text, device)
         elapsed_ms = (time.perf_counter() - started) * 1000
         return {'id': item_id, 'ok': True, 'score': score, 'error': None, 'elapsedMs': elapsed_ms}
@@ -117,8 +131,9 @@ def score_item (model: Any, processor: Any, item: dict[str, Any], device: str) -
         return {'id': item_id, 'ok': False, 'score': None, 'error': str(error), 'elapsedMs': elapsed_ms}
 
 
-def score_items (model: Any, processor: Any, items: list[dict[str, Any]], device: str) -> list[dict[str, Any]]:
-    return [score_item(model, processor, item, device) for item in items]
+def score_items (model: Any, processor: Any, items: list[dict[str, Any]], device: str,
+                  default_seed: int | None) -> list[dict[str, Any]]:
+    return [score_item(model, processor, item, device, default_seed) for item in items]
 
 
 def resolve_device (requested: str) -> str:
@@ -158,6 +173,10 @@ def parse_args (argv: list[str]) -> argparse.Namespace:
     parser.add_argument('--model', default=DEFAULT_MODEL)
     parser.add_argument('--revision', default=None)
     parser.add_argument('--device', default='cpu')
+    parser.add_argument('--seed', type=int, default=None,
+                         help='default seed pinning the audio feature extractor\'s random crop for reproducible '
+                              'scores on audio longer than CLAP\'s 10s window; a batch item may override this with '
+                              'its own "seed" field (unset: unseeded, matches prior behavior)')
     return parser.parse_args(argv)
 
 
@@ -179,7 +198,7 @@ def main (argv: list[str]) -> None:
         model, processor = load_clap(args.model, args.revision, device)
     except Exception as error:
         fail(f'failed to load CLAP model {args.model}: {error}')
-    scores = score_items(model, processor, items, device)
+    scores = score_items(model, processor, items, device, args.seed)
     resolved_revision = args.revision
     if hasattr(model, 'config'):
         resolved_revision = getattr(model.config, '_commit_hash', args.revision) or args.revision
