@@ -570,6 +570,21 @@ bool collect_ar_candidates(const float * logits, int64_t row_stride, int64_t eos
     return true;
 }
 
+int64_t compact_head_row_count(int64_t semantic_vocab) {
+    return semantic_vocab + 1;
+}
+
+bool compact_head_copy_plan(int64_t vocab, int64_t semantic_offset, int64_t semantic_vocab, int64_t eos,
+                            size_t row_size, std::array<CompactHeadCopy, 2> & plan) {
+    if (row_size == 0 || vocab <= 0 || semantic_offset < 0 || semantic_vocab <= 0 ||
+        semantic_offset > vocab - semantic_vocab || eos < 0 || eos >= vocab) {
+        return false;
+    }
+    plan[0] = { static_cast<size_t>(semantic_offset) * row_size, 0, static_cast<size_t>(semantic_vocab) * row_size };
+    plan[1] = { static_cast<size_t>(eos) * row_size, static_cast<size_t>(semantic_vocab) * row_size, row_size };
+    return true;
+}
+
 void guide_ar_candidates(ArCandidates & candidates, float cfg_scale) {
     const size_t count = candidates.conditional.size();
     candidates.guided.resize(count);

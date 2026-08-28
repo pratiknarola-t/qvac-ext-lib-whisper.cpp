@@ -11,9 +11,11 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -891,6 +893,64 @@ void test_ar_candidate_helpers() {
     CHECK(std::isinf(candidates.guided[3]) && candidates.guided[3] < 0.0f);
 }
 
+void test_compact_head_layout() {
+    using namespace tts_cpp::minimax::detail;
+
+    CHECK(compact_head_row_count(16384) == 16385);
+    CHECK(compact_head_row_count(0) == 1);
+
+    // A synthetic 10-row, 4-byte-row "vocabulary": semantic block at rows
+    // [3,6), EOS at row 1.
+    std::array<CompactHeadCopy, 2> plan{};
+    CHECK(compact_head_copy_plan(10, 3, 3, 1, 4, plan));
+    CHECK(plan[0].src_offset == 12 && plan[0].dst_offset == 0 && plan[0].nbytes == 12);
+    CHECK(plan[1].src_offset == 4 && plan[1].dst_offset == 12 && plan[1].nbytes == 4);
+    CHECK(!compact_head_copy_plan(10, 8, 3, 1, 4, plan));
+    CHECK(!compact_head_copy_plan(10, 3, 3, 10, 4, plan));
+    CHECK(!compact_head_copy_plan(10, 3, 3, 1, 0, plan));
+
+    // Apply the plan to a byte buffer and confirm the compact output holds
+    // exactly the semantic block followed by the EOS row.
+    std::vector<uint8_t> source(10 * 4);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<uint8_t>(i);
+    }
+    std::vector<uint8_t> compact(static_cast<size_t>(compact_head_row_count(3)) * 4, 0xAA);
+    memcpy(compact.data() + plan[0].dst_offset, source.data() + plan[0].src_offset, plan[0].nbytes);
+    memcpy(compact.data() + plan[1].dst_offset, source.data() + plan[1].src_offset, plan[1].nbytes);
+    CHECK(compact == std::vector<uint8_t>({12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 4, 5, 6, 7}));
+
+    // Index mapping: candidates collected from the compact layout must match
+    // candidates collected directly from the full-vocab layout, bit-for-bit.
+    const int64_t vocab = 20;
+    const int64_t semantic_offset = 5;
+    const int64_t semantic_vocab = 4;
+    const int64_t eos = 2;
+    std::vector<float> full(static_cast<size_t>(vocab) * 2);
+    for (size_t i = 0; i < full.size(); ++i) {
+        full[i] = static_cast<float>(i);
+    }
+    ArCandidates from_full;
+    int64_t nonfinite_full = 0;
+    CHECK(collect_ar_candidates(full.data(), vocab, eos, semantic_offset, semantic_vocab, from_full,
+                                nonfinite_full));
+
+    const int64_t compact_vocab = compact_head_row_count(semantic_vocab);
+    std::vector<float> compact_logits(static_cast<size_t>(compact_vocab) * 2);
+    for (int64_t row = 0; row < 2; ++row) {
+        const float * src_row = full.data() + row * vocab;
+        float *       dst_row = compact_logits.data() + row * compact_vocab;
+        memcpy(dst_row, src_row + semantic_offset, static_cast<size_t>(semantic_vocab) * sizeof(float));
+        dst_row[semantic_vocab] = src_row[eos];
+    }
+    ArCandidates from_compact;
+    int64_t nonfinite_compact = 0;
+    CHECK(collect_ar_candidates(compact_logits.data(), compact_vocab, semantic_vocab, kCompactHeadSemanticOffset,
+                                semantic_vocab, from_compact, nonfinite_compact));
+    CHECK(from_full.conditional == from_compact.conditional);
+    CHECK(from_full.unconditional == from_compact.unconditional);
+}
+
 void test_ar_acoustic_rows_and_frame_cap() {
     using namespace tts_cpp::minimax::detail;
     const int32_t codes[] = {2, 3, 4};
@@ -1239,6 +1299,7 @@ int main() {
     test_nonfinite_vocoder_orchestration();
     test_finite_vocoder_orchestration_clipping();
     test_ar_candidate_helpers();
+    test_compact_head_layout();
     test_ar_acoustic_rows_and_frame_cap();
     test_sampling_edges();
     test_model_compatibility();
