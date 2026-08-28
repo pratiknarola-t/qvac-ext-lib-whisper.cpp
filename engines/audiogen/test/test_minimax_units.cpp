@@ -7,6 +7,9 @@
 #include "minimax/progress.h"
 #include "minimax/request-utils.h"
 
+#include "ggml-alloc.h"
+#include "ggml.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -353,6 +356,65 @@ void test_production_dit_readback_preserves_velocity() {
     CHECK(error.empty());
     CHECK(requested_bytes == raw.size() * sizeof(float));
     CHECK(output == raw);
+}
+
+void test_depth_step_fused_readback_matches_source_tensors() {
+    // Mirrors mm3-depth-graph.h's per-step output fusion: reshape the hidden
+    // [H,1,2] and logits [V,1,2] CFG outputs to 1-D and concat along dim 0,
+    // then confirm one download splits back into the exact values each
+    // tensor was set to. H != V so a size mixup would size-mismatch, and
+    // distinct value ranges so a block swap or misaligned offset would show.
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    CHECK(cpu != nullptr);
+    if (!cpu) return;
+
+    const int64_t H = 5;
+    const int64_t V = 7;
+    constexpr size_t MAX_NODES = 8;
+
+    const size_t context_size =
+        ggml_tensor_overhead() * MAX_NODES + ggml_graph_overhead_custom(MAX_NODES, false);
+    ggml_init_params params = { context_size, nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+    CHECK(ctx != nullptr);
+
+    ggml_tensor * hidden = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, H, 1, 2);
+    ggml_tensor * logits = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, V, 1, 2);
+    ggml_set_input(hidden);
+    ggml_set_input(logits);
+
+    ggml_tensor * hidden_flat = ggml_reshape_1d(ctx, hidden, ggml_nelements(hidden));
+    ggml_tensor * logits_flat = ggml_reshape_1d(ctx, logits, ggml_nelements(logits));
+    ggml_tensor * fused       = ggml_concat(ctx, hidden_flat, logits_flat, 0);
+    ggml_set_output(fused);
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, MAX_NODES, false);
+    ggml_build_forward_expand(graph, fused);
+
+    ggml_gallocr_t allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu));
+    CHECK(ggml_gallocr_alloc_graph(allocator, graph));
+
+    std::vector<float> hidden_values(static_cast<size_t>(H * 2));
+    std::vector<float> logits_values(static_cast<size_t>(V * 2));
+    for (size_t i = 0; i < hidden_values.size(); i++) hidden_values[i] = static_cast<float>(i + 1);
+    for (size_t i = 0; i < logits_values.size(); i++) logits_values[i] = static_cast<float>(100 + i);
+    ggml_backend_tensor_set(hidden, hidden_values.data(), 0, hidden_values.size() * sizeof(float));
+    ggml_backend_tensor_set(logits, logits_values.data(), 0, logits_values.size() * sizeof(float));
+
+    CHECK(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS);
+
+    std::vector<float> fused_buf(hidden_values.size() + logits_values.size());
+    ggml_backend_tensor_get(fused, fused_buf.data(), 0, fused_buf.size() * sizeof(float));
+
+    const auto split = fused_buf.begin() + static_cast<std::ptrdiff_t>(hidden_values.size());
+    const std::vector<float> hidden_part(fused_buf.begin(), split);
+    const std::vector<float> logits_part(split, fused_buf.end());
+    CHECK(hidden_part == hidden_values);
+    CHECK(logits_part == logits_values);
+
+    ggml_gallocr_free(allocator);
+    ggml_free(ctx);
+    ggml_backend_free(cpu);
 }
 
 void test_production_cfg_euler_step() {
@@ -1163,6 +1225,7 @@ int main() {
     test_noise();
     test_flow_schedule();
     test_production_dit_readback_preserves_velocity();
+    test_depth_step_fused_readback_matches_source_tensors();
     test_production_cfg_euler_step();
     test_malformed_synthesis_metadata();
     test_vocoder_output_shape();
