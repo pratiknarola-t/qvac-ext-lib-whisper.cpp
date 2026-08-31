@@ -26,17 +26,88 @@ usage:
 Exit 0 if the comparison ran clean and any given gates pass, 1 otherwise
 (including on a directory that can't actually be compared -- a gate that
 returns 0 without having compared anything is worse than no gate).
+
+numpy carries the per-element work when it is importable; an equivalent
+stdlib implementation takes over when it is not, so the gate runs anywhere.
 """
 import argparse
+import array
 import json
+import math
 import sys
 from pathlib import Path
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 FIELDS = ["last-hidden", "sem-logits", "guided", "feedback", "depth-hidden"]
 ARGMAX_FIELDS = ["guided", "sem-logits"]
 TOP_K = 8
+F32_BYTES = 4
+
+
+def read_f32(path):
+    if np is not None:
+        return np.fromfile(path, dtype="<f4")
+    raw = path.read_bytes()
+    values = array.array("f")
+    values.frombytes(raw[:len(raw) - len(raw) % F32_BYTES])
+    if sys.byteorder != "little":
+        values.byteswap()
+    return values
+
+
+def accumulate_finite(a, b):
+    """Dot product, both squared norms, and the both-finite position count,
+    accumulated in one pass over the vectors."""
+    count = 0
+    dot = square_a = square_b = 0.0
+    for x, y in zip(a, b):
+        if not (math.isfinite(x) and math.isfinite(y)):
+            continue
+        count += 1
+        dot += x * y
+        square_a += x * x
+        square_b += y * y
+    return count, dot, math.sqrt(square_a), math.sqrt(square_b)
+
+
+def finite_dot_norms(a, b):
+    if np is None:
+        return accumulate_finite(a, b)
+    a, b = np.asarray(a), np.asarray(b)
+    finite = np.isfinite(a) & np.isfinite(b)
+    count = int(np.count_nonzero(finite))
+    if count == 0:
+        return 0, 0.0, 0.0, 0.0
+    a_f, b_f = a[finite].astype(np.float64), b[finite].astype(np.float64)
+    return count, float(a_f @ b_f), float(np.linalg.norm(a_f)), float(np.linalg.norm(b_f))
+
+
+def argmax_index(vec):
+    if np is None:
+        return max(range(len(vec)), key=vec.__getitem__)
+    return int(np.argmax(vec))
+
+
+def top_k_indices(vec, k):
+    """Indices of the k largest entries. Both backends sort ascending and
+    stably, so a tie at the k-th position resolves the same way in each."""
+    if k <= 0:
+        return set()
+    if np is None:
+        return set(sorted(range(len(vec)), key=vec.__getitem__)[-k:])
+    return set(np.argsort(vec, kind="stable")[-k:].tolist())
+
+
+def mean(values):
+    return sum(values) / len(values) if values else 0.0
+
+
+def min_index(values):
+    return min(range(len(values)), key=values.__getitem__)
 
 
 def die(message):
@@ -52,8 +123,8 @@ def load_field(dump_dir, iteration, field):
     path = dump_path(dump_dir, iteration, field)
     if not path.exists():
         die(f"{path}: missing")
-    data = np.fromfile(path, dtype="<f4")
-    if data.size == 0:
+    data = read_f32(path)
+    if len(data) == 0:
         die(f"{path}: empty")
     return data
 
@@ -75,37 +146,33 @@ def cosine(a, b):
     overlap, not just their relative order). Returns (cosine, finite_fraction);
     cosine is None only when no position is finite on both sides -- that is
     reported as missing, not silently coerced to a number."""
-    finite = np.isfinite(a) & np.isfinite(b)
-    finite_fraction = float(np.mean(finite)) if a.size else 0.0
-    if not np.any(finite):
+    count, dot, norm_a, norm_b = finite_dot_norms(a, b)
+    finite_fraction = count / len(a) if len(a) else 0.0
+    if count == 0:
         return None, finite_fraction
 
-    a_f, b_f = a[finite].astype(np.float64), b[finite].astype(np.float64)
-    norm_a, norm_b = np.linalg.norm(a_f), np.linalg.norm(b_f)
     if norm_a == 0.0 and norm_b == 0.0:
         return 1.0, finite_fraction
     if norm_a == 0.0 or norm_b == 0.0:
         return 0.0, finite_fraction
-    return float(a_f @ b_f / (norm_a * norm_b)), finite_fraction
+    return dot / (norm_a * norm_b), finite_fraction
 
 
 def conditional_half(sem_logits):
-    if sem_logits.size % 2 != 0:
+    if len(sem_logits) % 2 != 0:
         die("sem-logits length is odd; expected equal-sized [conditional, unconditional] halves")
-    half = sem_logits.size // 2
+    half = len(sem_logits) // 2
     return sem_logits[:half]
 
 
 def top_k_overlap(ref_vec, cand_vec, k):
-    k = min(k, ref_vec.size)
-    ref_top = set(np.argsort(ref_vec)[-k:].tolist())
-    cand_top = set(np.argsort(cand_vec)[-k:].tolist())
-    return len(ref_top & cand_top)
+    k = min(k, len(ref_vec))
+    return len(top_k_indices(ref_vec, k) & top_k_indices(cand_vec, k))
 
 
 def argmax_stat(ref_vec, cand_vec):
     return {
-        "agree": int(np.argmax(ref_vec)) == int(np.argmax(cand_vec)),
+        "agree": argmax_index(ref_vec) == argmax_index(cand_vec),
         "top_k_overlap": top_k_overlap(ref_vec, cand_vec, TOP_K),
     }
 
@@ -113,8 +180,8 @@ def argmax_stat(ref_vec, cand_vec):
 def compare_field_at_iteration(ref_dir, cand_dir, iteration, field):
     ref = load_field(ref_dir, iteration, field)
     cand = load_field(cand_dir, iteration, field)
-    if ref.size != cand.size:
-        die(f"iteration {iteration} {field}: size mismatch ({ref.size} vs {cand.size})")
+    if len(ref) != len(cand):
+        die(f"iteration {iteration} {field}: size mismatch ({len(ref)} vs {len(cand)})")
     return ref, cand
 
 
@@ -126,10 +193,8 @@ def compare_iteration(ref_dir, cand_dir, iteration, field_cosines, argmax_accum)
         field_cosines[field].append({"cosine": cosine_value, "finite_fraction": finite_fraction})
         per_field_cosine[field] = cosine_value
 
-        # argmax/top-k are valid on masked (-inf-containing) vectors as-is --
-        # np.argmax/np.argsort naturally rank -inf entries lowest, matching
-        # what the sampler itself would see -- so these run on the raw
-        # vectors, unlike cosine which needs the finite-both subset.
+        # argmax/top-k rank -inf lowest, which is what the sampler sees, so
+        # they take the raw vectors; cosine needs the finite-both subset.
         if field == "guided":
             argmax_accum["guided"].append(argmax_stat(ref, cand))
         elif field == "sem-logits":
@@ -157,7 +222,7 @@ def summarize_field(entries):
     to the original iteration index, not a position in the filtered list."""
     n = len(entries)
     comparable = [(i, e["cosine"]) for i, e in enumerate(entries) if e["cosine"] is not None]
-    mean_finite_fraction = float(np.mean([e["finite_fraction"] for e in entries])) if n else 0.0
+    mean_finite_fraction = mean([e["finite_fraction"] for e in entries])
 
     if not comparable:
         return {
@@ -166,11 +231,11 @@ def summarize_field(entries):
         }
 
     cosines_only = [c for _, c in comparable]
-    worst_iteration, min_cosine = comparable[int(np.argmin(cosines_only))]
+    worst_iteration, min_cosine = comparable[min_index(cosines_only)]
     return {
         "n": n,
         "n_comparable": len(comparable),
-        "mean_cosine": float(np.mean(cosines_only)),
+        "mean_cosine": mean(cosines_only),
         "min_cosine": float(min_cosine),
         "worst_iteration": int(worst_iteration),
         "mean_finite_fraction": mean_finite_fraction,
@@ -202,6 +267,12 @@ def build_summary(field_cosines, argmax_accum, per_iteration_min):
         "overall_worst_iteration": overall_worst_iteration,
         "overall_worst_min_cosine": overall_worst_min_cosine,
     }
+
+
+def comparability_violations(summary):
+    if summary["overall_worst_min_cosine"] is not None:
+        return []
+    return ["no field had a comparable (finite-on-both-sides) position in any iteration"]
 
 
 def apply_gates(summary, min_cosine, min_argmax_agree):
@@ -286,7 +357,8 @@ def main():
     field_cosines, argmax_accum, per_iteration_min = compare(ref_dir, cand_dir, n_ref)
     summary = build_summary(field_cosines, argmax_accum, per_iteration_min)
     summary["gated"] = args.min_cosine is not None or args.min_argmax_agree is not None
-    summary["violations"] = apply_gates(summary, args.min_cosine, args.min_argmax_agree)
+    summary["violations"] = (comparability_violations(summary) or
+                             apply_gates(summary, args.min_cosine, args.min_argmax_agree))
 
     if args.json:
         print(json.dumps(summary, indent=2))
