@@ -7,10 +7,11 @@ necessarily F32). The per-type byte summary also shows whether the file hit
 its size target or silently stayed mostly at source precision through the
 quantizer's block-size alignment fallback.
 
-The default deny-list covers the MM3 synth components that stay unquantized
-(condition encoder, vocoder, DiT timestep Fourier basis), using the
-tensor-name prefixes the converter actually writes. The depth decoder is not
-on it: the policy pins depth at Q8_0 in quantized synth files.
+The default deny-list covers the MM3 synth tensors that stay unquantized, as
+the converter names them: the condition encoder, the vocoder, the DiT timestep
+Fourier basis, and the depth decoder's positional embedding, which the depth
+graph views raw. The rest of the depth decoder is pinned at Q8_0, not held at
+source precision, so it is deliberately absent from the list.
 
 usage: audit_quant_types.py in.gguf [deny_substr,deny_substr,...]
 Exit 0 and prints a per-type byte summary plus a deny-list violation list
@@ -20,7 +21,7 @@ import sys
 
 from gguf import GGUFReader
 
-DEFAULT_DENY = ["cond.", "voc.", "time_fourier"]
+DEFAULT_DENY = ["cond.", "voc.", "time_fourier", "depth.pos_embd.weight"]
 
 UNQUANTIZED_TYPES = {"F32", "F16", "BF16"}
 
