@@ -11,11 +11,13 @@ flags `test_` followed by a long lowercase run as an API key.
 """
 
 import importlib.util
+import io
 import pathlib
 import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 NEG_INF = float("-inf")
 FIELDS = ["last-hidden", "sem-logits", "guided", "feedback", "depth-hidden"]
@@ -90,17 +92,10 @@ class DirCase(unittest.TestCase):
 
     def run_main(self, extra=()):
         argv = ["compare_ar_dumps.py", str(self.ref), str(self.cand), "--json", *extra]
-        saved = sys.argv
-        sys.argv = argv
-        try:
-            with open("/dev/null", "w") as sink:
-                saved_out, sys.stdout = sys.stdout, sink
-                try:
-                    return comparator.main()
-                finally:
-                    sys.stdout = saved_out
-        finally:
-            sys.argv = saved
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(sys, "stdout", io.StringIO()), \
+                mock.patch.object(sys, "stderr", io.StringIO()):
+            return comparator.main()
 
     def write_pair(self, ref_iters, cand_iters):
         write_dump_dir(self.ref, ref_iters)
