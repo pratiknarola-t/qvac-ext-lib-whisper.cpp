@@ -1871,6 +1871,16 @@ void test_quantize_gguf_roundtrip() {
 // encoder must pass through byte-identical, the depth decoder must land at
 // Q8_0, and the DiT takes the variant base type. A regression here is silent
 // (the file still loads) and only shows up as degraded audio.
+// Each tensor gets its own source values so an expectation built from the
+// wrong tensor's bytes cannot pass.
+std::vector<float> quant_source_row(size_t count, float offset) {
+    std::vector<float> values(count);
+    for (size_t i = 0; i < count; ++i) {
+        values[i] = ((float) i - offset) / 64.0f;
+    }
+    return values;
+}
+
 void test_quantize_gguf_roundtrip_mm3() {
     using namespace tts_cpp::acestep;
 
@@ -1879,10 +1889,9 @@ void test_quantize_gguf_roundtrip_mm3() {
 
     // 256-wide rows satisfy the k-quant superblock alignment, so only the
     // policy (not the alignment fallback) decides who quantizes.
-    std::vector<float> row(256 * 2);
-    for (size_t i = 0; i < row.size(); ++i) {
-        row[i] = ((float) i - 256.0f) / 64.0f;
-    }
+    const std::vector<float> cond_row  = quant_source_row(256 * 2, 256.0f);
+    const std::vector<float> depth_row = quant_source_row(256 * 2, 320.0f);
+    const std::vector<float> dit_row   = quant_source_row(256 * 2, 400.0f);
 
     ggml_init_params ip{ 4 * 1024 * 1024, nullptr, /*no_alloc=*/false };
     ggml_context *   ctx = ggml_init(ip);
@@ -1891,22 +1900,24 @@ void test_quantize_gguf_roundtrip_mm3() {
 
     ggml_tensor * cond = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 256, 2);
     ggml_set_name(cond, "cond.proj.weight");
-    ggml_fp32_to_fp16_row(row.data(), (ggml_fp16_t *) cond->data, (int64_t) row.size());
+    ggml_fp32_to_fp16_row(cond_row.data(), (ggml_fp16_t *) cond->data, (int64_t) cond_row.size());
     gguf_add_tensor(gc, cond);
-    std::vector<ggml_fp16_t> cond_bytes((size_t) row.size());
-    std::memcpy(cond_bytes.data(), cond->data, row.size() * sizeof(ggml_fp16_t));
+    std::vector<ggml_fp16_t> cond_bytes((size_t) cond_row.size());
+    std::memcpy(cond_bytes.data(), cond->data, cond_row.size() * sizeof(ggml_fp16_t));
 
     ggml_tensor * depth = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 256, 2);
     ggml_set_name(depth, "depth.blk.0.attn_v.weight");
-    ggml_fp32_to_fp16_row(row.data(), (ggml_fp16_t *) depth->data, (int64_t) row.size());
+    ggml_fp32_to_fp16_row(depth_row.data(), (ggml_fp16_t *) depth->data, (int64_t) depth_row.size());
     gguf_add_tensor(gc, depth);
-    std::vector<ggml_fp16_t> depth_bytes((size_t) row.size());
-    std::memcpy(depth_bytes.data(), depth->data, row.size() * sizeof(ggml_fp16_t));
+    std::vector<ggml_fp16_t> depth_bytes((size_t) depth_row.size());
+    std::memcpy(depth_bytes.data(), depth->data, depth_row.size() * sizeof(ggml_fp16_t));
 
     ggml_tensor * dit = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 256, 2);
     ggml_set_name(dit, "dit.blk.0.attn_qkv.weight");
-    ggml_fp32_to_fp16_row(row.data(), (ggml_fp16_t *) dit->data, (int64_t) row.size());
+    ggml_fp32_to_fp16_row(dit_row.data(), (ggml_fp16_t *) dit->data, (int64_t) dit_row.size());
     gguf_add_tensor(gc, dit);
+    std::vector<ggml_fp16_t> dit_bytes((size_t) dit_row.size());
+    std::memcpy(dit_bytes.data(), dit->data, dit_row.size() * sizeof(ggml_fp16_t));
 
     CHECK(gguf_write_to_file(gc, in_path.c_str(), /*only_meta=*/false));
     gguf_free(gc);
@@ -1935,7 +1946,7 @@ void test_quantize_gguf_roundtrip_mm3() {
         ggml_tensor * q_depth = ggml_get_tensor(out_meta, "depth.blk.0.attn_v.weight");
         CHECK(q_depth && q_depth->type == GGML_TYPE_Q8_0);
         if (q_depth) {
-            std::vector<float> f32(row.size());
+            std::vector<float> f32(depth_row.size());
             ggml_fp16_to_fp32_row(depth_bytes.data(), f32.data(), (int64_t) f32.size());
             std::vector<uint8_t> expected(ggml_row_size(GGML_TYPE_Q8_0, 256) * 2);
             ggml_quantize_chunk(GGML_TYPE_Q8_0, f32.data(), expected.data(), 0, 2, 256, nullptr);
@@ -1947,17 +1958,17 @@ void test_quantize_gguf_roundtrip_mm3() {
         if (q_dit) {
             // The writer must emit exactly ggml's reference quantization of the
             // F32-converted source rows (ggml_quantize_chunk, no imatrix).
-            std::vector<float> f32(row.size());
-            ggml_fp16_to_fp32_row(depth_bytes.data(), f32.data(), (int64_t) f32.size());
+            std::vector<float> f32(dit_row.size());
+            ggml_fp16_to_fp32_row(dit_bytes.data(), f32.data(), (int64_t) f32.size());
             std::vector<uint8_t> expected(ggml_row_size(GGML_TYPE_Q4_K, 256) * 2);
             ggml_quantize_chunk(GGML_TYPE_Q4_K, f32.data(), expected.data(), 0, 2, 256, nullptr);
             CHECK(std::memcmp(q_dit->data, expected.data(), expected.size()) == 0);
 
-            std::vector<float> back(row.size());
+            std::vector<float> back(dit_row.size());
             ggml_get_type_traits(GGML_TYPE_Q4_K)->to_float(q_dit->data, back.data(),
                                                            (int64_t) back.size());
             for (size_t i = 0; i < back.size(); ++i) {
-                CHECK(std::fabs(back[i] - row[i]) < 0.25f);
+                CHECK(std::fabs(back[i] - dit_row[i]) < 0.25f);
             }
         }
 
