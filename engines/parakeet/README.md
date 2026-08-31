@@ -387,6 +387,14 @@ Useful groups include `--threads`, `--n-gpu-layers`, `--backends-dir`,
 `--diarization-model`, OpenCL environment controls, `--bench`, `--profile`,
 and `--dump-mel`. Run `parakeet --help` for the complete list.
 
+`--bench` (with `--bench-warmup`, `--bench-runs`, and `--bench-json`) covers
+offline transcription, offline and streaming Sortformer diarization, and
+speaker-attributed transcription. Each mode writes the same JSON report, keyed
+by `model_type`; the diarization modes add `segments` / `num_spks`, and the
+attributed mode adds `asr_calls` / `merged_segments` and reports only
+`inference_ms`, because its stages span two engines. `--bench` is rejected with
+`--stream` on a transcription model, and `--profile` is transcription-only.
+
 ```bash
 build-parakeet/parakeet \
   --model engines/parakeet/models/parakeet-tdt-0.6b-v3.q8_0.gguf \

@@ -479,7 +479,7 @@ if (PARAKEET_BUILD_TESTS)
     # `ctest -N`) but marked DISABLED so a missing reference dump
     # shows as "Not Run" rather than a failure.
     function(parakeet_register_test target)
-        cmake_parse_arguments(QPRT "" "LABEL;EXE" "ARGS;REQUIRES" ${ARGN})
+        cmake_parse_arguments(QPRT "" "LABEL;EXE" "ARGS;REQUIRES;SCRIPT" ${ARGN})
         if (NOT DEFINED QPRT_LABEL)
             set(QPRT_LABEL "cpu")
         endif()
@@ -491,8 +491,11 @@ if (PARAKEET_BUILD_TESTS)
         if (NOT DEFINED QPRT_EXE)
             set(QPRT_EXE ${target})
         endif()
+        # SCRIPT (optional, e.g. "${Python3_EXECUTABLE};path/to/driver.py")
+        # wraps the target: the driver receives the exe path as argv[1]
+        # and ARGS after it. Empty SCRIPT invokes the exe directly.
         add_test(NAME ${target}
-                 COMMAND $<TARGET_FILE:${QPRT_EXE}> ${QPRT_ARGS})
+                 COMMAND ${QPRT_SCRIPT} $<TARGET_FILE:${QPRT_EXE}> ${QPRT_ARGS})
         set_property(TEST ${target} PROPERTY LABELS ${QPRT_LABEL})
         if (WIN32)
             # When ggml builds as shared (the clang-cl / MSVC default with
@@ -747,6 +750,30 @@ if (PARAKEET_BUILD_TESTS)
             COMMAND ${Python3_EXECUTABLE}
                     "${CMAKE_CURRENT_SOURCE_DIR}/test/test_convert_nemo_to_gguf.py")
         set_property(TEST test-converter-rnnt PROPERTY LABELS unit)
+    endif()
+
+    # --bench/--bench-json used to be a silent no-op in the diarization
+    # modes: each returned before the bench block. One test per mode.
+    if (Python3_Interpreter_FOUND)
+        set(_qvp_bench_json_py "${CMAKE_CURRENT_SOURCE_DIR}/test/test_bench_json.py")
+        foreach(_mode asr sortformer sortformer-stream attributed)
+            if (_mode STREQUAL "asr")
+                set(_qvp_bench_models "${_qvp_tdt_q8_gguf}")
+                set(_qvp_bench_wav    "${_qvp_jfk_wav}")
+            elseif(_mode STREQUAL "attributed")
+                set(_qvp_bench_models "${_qvp_tdt_q8_gguf}" "${_qvp_sfsv21_q8_gguf}")
+                set(_qvp_bench_wav    "${_qvp_diar_wav}")
+            else()
+                set(_qvp_bench_models "${_qvp_sfsv21_q8_gguf}")
+                set(_qvp_bench_wav    "${_qvp_diar_wav}")
+            endif()
+            parakeet_register_test(test-bench-json-${_mode}
+                LABEL    "fixture"
+                EXE      parakeet-cli
+                SCRIPT   "${Python3_EXECUTABLE}" "${_qvp_bench_json_py}"
+                ARGS     "${_mode}" ${_qvp_bench_models} "${_qvp_bench_wav}"
+                REQUIRES ${_qvp_bench_models} "${_qvp_bench_wav}")
+        endforeach()
     endif()
 
     find_program(PARAKEET_BASH_EXECUTABLE bash)

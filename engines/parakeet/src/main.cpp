@@ -22,8 +22,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -372,6 +374,275 @@ struct CliOpts {
     bool verbose      = false;
 };
 
+// One timing series per bench lane. Paths whose stages are not
+// separable fill only `inf`.
+struct BenchSeries {
+    std::vector<double> mel, enc, dec, inf;
+    int encoder_frames = 0;
+};
+
+// Everything the bench summary and JSON need beyond the timing series.
+// `counts` carries the per-mode tallies (tokens, segments, speakers).
+struct BenchMeta {
+    std::string model_type = "asr";
+    std::string model_path;
+    std::string wav_path;
+    std::string backend;
+    int    n_gpu_layers  = 0;
+    int    n_threads     = 0;
+    int    warmup_runs   = 0;
+    int    timed_runs    = 0;
+    double audio_ms      = 0.0;
+    size_t audio_samples = 0;
+    int    sample_rate   = 0;
+    int    mel_frames    = 0;
+    double load_ms       = 0.0;
+    double wav_read_ms   = 0.0;
+    std::string transcript;
+    bool   stage_split   = true;
+    std::vector<std::pair<std::string, long long>> counts;
+};
+
+struct BenchStats {
+    AggStats mel, enc, dec, inf;
+    double   rtf_mean   = 0.0;
+    double   rtf_median = 0.0;
+    double   rtf_best   = 0.0;
+};
+
+// Runtime-accurate backend label. Reads the post-fallback active backend
+// off the loaded model rather than guessing from compile-time #ifdefs, so
+// OpenCL and multi-GPU builds report what init_gpu_backend() actually
+// selected. Lower-cased to the legacy "ggml-metal" / "ggml-cuda0" /
+// "ggml-opencl" spellings that existing bench sweeps grep for.
+std::string backend_label(ggml_backend_t b) {
+    const char * raw = b != nullptr ? ggml_backend_name(b) : nullptr;
+    std::string s = std::string("ggml-") + (raw ? raw : "cpu");
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return s;
+}
+
+BenchStats summarize_bench(const BenchMeta & m, const BenchSeries & s) {
+    BenchStats st;
+    st.mel = aggregate(s.mel);
+    st.enc = aggregate(s.enc);
+    st.dec = aggregate(s.dec);
+    st.inf = aggregate(s.inf);
+    st.rtf_mean   = st.inf.mean   / m.audio_ms;
+    st.rtf_median = st.inf.median / m.audio_ms;
+    st.rtf_best   = st.inf.min    / m.audio_ms;
+    return st;
+}
+
+void print_bench_header(const BenchMeta & m) {
+    PARAKEET_LOG_INFO("[bench] model=%s  wav=%s (%.2f s audio, %d samples @ %d Hz)\n",
+                 m.model_path.c_str(), m.wav_path.c_str(),
+                 m.audio_ms / 1000.0, (int) m.audio_samples, m.sample_rate);
+    PARAKEET_LOG_INFO("[bench] threads=%d  warmup=%d  runs=%d\n",
+                 m.n_threads, m.warmup_runs, m.timed_runs);
+    PARAKEET_LOG_INFO("[bench] load=%.1fms wav_read=%.1fms\n", m.load_ms, m.wav_read_ms);
+}
+
+int run_bench_warmup(const BenchMeta & m, const std::function<int(RunTimes &)> & once) {
+    for (int w = 0; w < m.warmup_runs; ++w) {
+        RunTimes t;
+        if (int rc = once(t); rc != 0) return 10 + rc;
+        if (m.stage_split) {
+            PARAKEET_LOG_INFO("[bench] warmup %d/%d  mel=%.1fms enc=%.1fms dec=%.1fms  RTF=%.3f\n",
+                         w + 1, m.warmup_runs, t.mel_ms, t.enc_ms, t.dec_ms, t.inference_ms / m.audio_ms);
+        } else {
+            PARAKEET_LOG_INFO("[bench] warmup %d/%d  inference=%.1fms  RTF=%.3f\n",
+                         w + 1, m.warmup_runs, t.inference_ms, t.inference_ms / m.audio_ms);
+        }
+    }
+    return 0;
+}
+
+int run_bench_timed(const BenchMeta & m, const std::function<int(RunTimes &)> & once, BenchSeries & out) {
+    for (int r = 0; r < m.timed_runs; ++r) {
+        RunTimes t;
+        if (int rc = once(t); rc != 0) return 20 + rc;
+        out.mel.push_back(t.mel_ms);
+        out.enc.push_back(t.enc_ms);
+        out.dec.push_back(t.dec_ms);
+        out.inf.push_back(t.inference_ms);
+        out.encoder_frames = t.encoder_frames;
+        if (m.stage_split) {
+            PARAKEET_LOG_INFO("[bench] run %d/%d    mel=%.1fms enc=%.1fms dec=%.1fms inference=%.1fms  RTF=%.3f\n",
+                         r + 1, m.timed_runs, t.mel_ms, t.enc_ms, t.dec_ms,
+                         t.inference_ms, t.inference_ms / m.audio_ms);
+        } else {
+            PARAKEET_LOG_INFO("[bench] run %d/%d    inference=%.1fms  RTF=%.3f\n",
+                         r + 1, m.timed_runs, t.inference_ms, t.inference_ms / m.audio_ms);
+        }
+    }
+    return 0;
+}
+
+void print_bench_summary(const BenchMeta & m, const BenchStats & st) {
+    const bool noisy = st.inf.stdev > 0.2 * st.inf.mean;
+    PARAKEET_LOG_INFO(
+        "[bench] ----------- summary (%d timed runs, warmup excluded) -----------\n"
+        "[bench]   audio              = %.3f s (%zu samples @ %d Hz)\n"
+        "[bench]   model load         = %.1f ms\n"
+        "[bench]   wav read           = %.1f ms\n"
+        "[bench]                         mean      med       min       max       std\n",
+        m.timed_runs, m.audio_ms / 1000.0, m.audio_samples, m.sample_rate, m.load_ms, m.wav_read_ms);
+    if (m.stage_split) {
+        PARAKEET_LOG_INFO(
+            "[bench]   mel        ms    %8.2f  %7.2f  %7.2f  %7.2f  %7.2f\n"
+            "[bench]   encoder    ms    %8.2f  %7.2f  %7.2f  %7.2f  %7.2f\n"
+            "[bench]   decode     ms    %8.2f  %7.2f  %7.2f  %7.2f  %7.2f\n",
+            st.mel.mean, st.mel.median, st.mel.min, st.mel.max, st.mel.stdev,
+            st.enc.mean, st.enc.median, st.enc.min, st.enc.max, st.enc.stdev,
+            st.dec.mean, st.dec.median, st.dec.min, st.dec.max, st.dec.stdev);
+    }
+    PARAKEET_LOG_INFO(
+        "[bench]   inference  ms    %8.2f  %7.2f  %7.2f  %7.2f  %7.2f\n"
+        "[bench]   RTF (median/best) = %.3f / %.3f    (realtime multiple = %.1fx / %.1fx)\n",
+        st.inf.mean, st.inf.median, st.inf.min, st.inf.max, st.inf.stdev,
+        st.rtf_median, st.rtf_best,
+        (st.rtf_median > 0 ? 1.0 / st.rtf_median : 0.0),
+        (st.rtf_best   > 0 ? 1.0 / st.rtf_best   : 0.0));
+    for (size_t i = 0; i < m.counts.size(); ++i) {
+        const bool last = (i + 1 == m.counts.size());
+        PARAKEET_LOG_INFO("[bench]   %-19s= %lld%s\n",
+                     m.counts[i].first.c_str(), m.counts[i].second,
+                     last && noisy ? "  (WARNING: stdev > 20% of mean — consider more warmup / runs)" : "");
+    }
+    PARAKEET_LOG_INFO("[bench] ---------------------------------------------------------------%s\n",
+                 noisy ? "\n[bench] prefer the median / best RTF — mean is skewed by outliers." : "");
+}
+
+void write_json_stats(FILE * fp, const char * name, const AggStats & s, const std::vector<double> & v) {
+    std::fprintf(fp, "    \"%s_ms\": {\"mean\": %.3f, \"median\": %.3f, \"stdev\": %.3f, \"min\": %.3f, \"max\": %.3f, \"samples\": [",
+                 name, s.mean, s.median, s.stdev, s.min, s.max);
+    for (size_t i = 0; i < v.size(); ++i) std::fprintf(fp, "%s%.3f", i == 0 ? "" : ", ", v[i]);
+    std::fprintf(fp, "]}");
+}
+
+int write_bench_json(const std::string & path, const BenchMeta & m,
+                     const BenchSeries & s, const BenchStats & st) {
+    FILE * fp = std::fopen(path.c_str(), "w");
+    if (!fp) {
+        PARAKEET_LOG_ERROR("error: cannot open %s for writing\n", path.c_str());
+        return 30;
+    }
+    std::fprintf(fp, "{\n");
+    std::fprintf(fp, "  \"model\": \"%s\",\n",       m.model_path.c_str());
+    std::fprintf(fp, "  \"model_type\": \"%s\",\n",  m.model_type.c_str());
+    std::fprintf(fp, "  \"wav\": \"%s\",\n",         m.wav_path.c_str());
+    std::fprintf(fp, "  \"backend\": \"%s\",\n",     m.backend.c_str());
+    std::fprintf(fp, "  \"n_gpu_layers\": %d,\n",    m.n_gpu_layers);
+    std::fprintf(fp, "  \"threads\": %d,\n",         m.n_threads);
+    std::fprintf(fp, "  \"warmup_runs\": %d,\n",     m.warmup_runs);
+    std::fprintf(fp, "  \"timed_runs\":  %d,\n",     m.timed_runs);
+    std::fprintf(fp, "  \"audio_seconds\": %.6f,\n", m.audio_ms / 1000.0);
+    std::fprintf(fp, "  \"audio_samples\": %zu,\n",  m.audio_samples);
+    std::fprintf(fp, "  \"sample_rate\": %d,\n",     m.sample_rate);
+    std::fprintf(fp, "  \"mel_frames\": %d,\n",      m.mel_frames);
+    std::fprintf(fp, "  \"encoder_frames\": %d,\n",  s.encoder_frames);
+    for (const auto & c : m.counts) {
+        std::fprintf(fp, "  \"%s\": %lld,\n", c.first.c_str(), c.second);
+    }
+    std::fprintf(fp, "  \"transcript\": \"");
+    for (char c : m.transcript) {
+        if      (c == '"')  std::fputs("\\\"", fp);
+        else if (c == '\\') std::fputs("\\\\", fp);
+        else                std::fputc(c, fp);
+    }
+    std::fprintf(fp, "\",\n");
+    std::fprintf(fp, "  \"load_ms\": %.3f,\n",     m.load_ms);
+    std::fprintf(fp, "  \"wav_read_ms\": %.3f,\n", m.wav_read_ms);
+    if (m.stage_split) {
+        write_json_stats(fp, "mel",     st.mel, s.mel); std::fprintf(fp, ",\n");
+        write_json_stats(fp, "encoder", st.enc, s.enc); std::fprintf(fp, ",\n");
+        write_json_stats(fp, "decode",  st.dec, s.dec); std::fprintf(fp, ",\n");
+    }
+    write_json_stats(fp, "inference", st.inf, s.inf);   std::fprintf(fp, ",\n");
+    std::fprintf(fp, "    \"rtf_mean\":   %.6f,\n", st.rtf_mean);
+    std::fprintf(fp, "    \"rtf_median\": %.6f,\n", st.rtf_median);
+    std::fprintf(fp, "    \"rtf_best\":   %.6f\n",  st.rtf_best);
+    std::fprintf(fp, "}\n");
+    std::fclose(fp);
+    PARAKEET_LOG_INFO("[bench] wrote %s\n", path.c_str());
+    return 0;
+}
+
+// Warmup, timed runs, summary, and optional JSON for one bench lane.
+// `finish` fills the per-mode tallies once the runs are done.
+int run_bench_lane(BenchMeta & m, const ExtraCliOpts & extra,
+                   const std::function<int(RunTimes &)> & once,
+                   const std::function<void(BenchMeta &)> & finish) {
+    print_bench_header(m);
+    if (int rc = run_bench_warmup(m, once); rc != 0) return rc;
+    BenchSeries series;
+    if (int rc = run_bench_timed(m, once, series); rc != 0) return rc;
+    finish(m);
+    const BenchStats st = summarize_bench(m, series);
+    print_bench_summary(m, st);
+    if (extra.bench_json_path.empty()) return 0;
+    return write_bench_json(extra.bench_json_path, m, series, st);
+}
+
+BenchMeta make_bench_meta(const char * model_type, const CliOpts & opts, const ExtraCliOpts & extra,
+                          ggml_backend_t backend, size_t audio_samples, int sample_rate,
+                          double audio_ms, double load_ms, double wav_read_ms) {
+    BenchMeta m;
+    m.model_type    = model_type;
+    m.model_path    = opts.model_gguf_path;
+    m.wav_path      = opts.wav_path;
+    m.backend       = backend_label(backend);
+    m.n_gpu_layers  = opts.n_gpu_layers;
+    m.n_threads     = opts.n_threads;
+    m.warmup_runs   = extra.bench_warmup;
+    m.timed_runs    = extra.bench_runs;
+    m.audio_ms      = audio_ms;
+    m.audio_samples = audio_samples;
+    m.sample_rate   = sample_rate;
+    m.load_ms       = load_ms;
+    m.wav_read_ms   = wav_read_ms;
+    return m;
+}
+
+void print_diarization_segments(const parakeet::DiarizationResult & diar, const std::string & emit_fmt) {
+    for (const auto & s : diar.segments) {
+        if (emit_fmt == "jsonl") {
+            std::printf("{\"speaker\":%d,\"start\":%.3f,\"end\":%.3f}\n",
+                        s.speaker_id, s.start_s, s.end_s);
+        } else {
+            std::printf("[%.2f-%.2f] speaker_%d\n", s.start_s, s.end_s, s.speaker_id);
+        }
+    }
+}
+
+void print_attributed_segments(const parakeet::AttributedTranscriptionResult & attr,
+                               const std::string & emit_fmt) {
+    for (const auto & s : attr.segments) {
+        if (emit_fmt == "jsonl") {
+            std::printf("{\"speaker\":%d,\"start\":%.3f,\"end\":%.3f,\"text\":\"",
+                        s.speaker_id, s.start_s, s.end_s);
+            for (char c : s.text) {
+                switch (c) {
+                    case '"':  std::fputs("\\\"", stdout); break;
+                    case '\\': std::fputs("\\\\", stdout); break;
+                    case '\n': std::fputs("\\n",  stdout); break;
+                    case '\r': std::fputs("\\r",  stdout); break;
+                    case '\t': std::fputs("\\t",  stdout); break;
+                    default:
+                        if ((unsigned char) c < 0x20) std::printf("\\u%04x", c);
+                        else std::fputc(c, stdout);
+                }
+            }
+            std::printf("\"}\n");
+        } else {
+            std::printf("[%.2f-%.2f] speaker_%d: %s\n",
+                        s.start_s, s.end_s, s.speaker_id, s.text.c_str());
+        }
+    }
+}
+
 }
 
 extern "C" int parakeet_cli_main(int argc, char ** argv) {
@@ -546,6 +817,12 @@ extern "C" int parakeet_cli_main(int argc, char ** argv) {
             return 5;
         }
 
+        if (extra.profile) {
+            PARAKEET_LOG_ERROR("error: --profile is not supported for speaker-attributed\n"
+                                 "       transcription; use --bench\n");
+            return 2;
+        }
+
         EngineOptions sf_opts;
         sf_opts.model_gguf_path = extra.diarization_model_path;
         sf_opts.n_gpu_layers    = opts.n_gpu_layers;
@@ -571,34 +848,33 @@ extern "C" int parakeet_cli_main(int argc, char ** argv) {
         topts.min_segment_ms = extra.attributed_min_segment_ms;
         topts.pad_segment_ms = extra.attributed_pad_segment_ms;
 
-        const auto t_attr = clock::now();
-        AttributedTranscriptionResult attr = transcribe_samples_with_speakers(
-            sf_engine, asr_engine, samples.data(), (int) samples.size(), sr, topts);
-        const double attr_ms = ms_since(t_attr);
-
         const std::string emit_fmt = extra.emit_format;
-        for (const auto & s : attr.segments) {
-            if (emit_fmt == "jsonl") {
-                std::printf("{\"speaker\":%d,\"start\":%.3f,\"end\":%.3f,\"text\":\"",
-                            s.speaker_id, s.start_s, s.end_s);
-                for (char c : s.text) {
-                    switch (c) {
-                        case '"':  std::fputs("\\\"", stdout); break;
-                        case '\\': std::fputs("\\\\", stdout); break;
-                        case '\n': std::fputs("\\n",  stdout); break;
-                        case '\r': std::fputs("\\r",  stdout); break;
-                        case '\t': std::fputs("\\t",  stdout); break;
-                        default:
-                            if ((unsigned char) c < 0x20) std::printf("\\u%04x", c);
-                            else std::fputc(c, stdout);
-                    }
-                }
-                std::printf("\"}\n");
-            } else {
-                std::printf("[%.2f-%.2f] speaker_%d: %s\n",
-                            s.start_s, s.end_s, s.speaker_id, s.text.c_str());
-            }
+        AttributedTranscriptionResult attr;
+        double attr_ms = 0.0;
+        auto attributed_once = [&](RunTimes & t) -> int {
+            const auto t_attr = clock::now();
+            attr = transcribe_samples_with_speakers(
+                sf_engine, asr_engine, samples.data(), (int) samples.size(), sr, topts);
+            attr_ms = ms_since(t_attr);
+            t.inference_ms = attr_ms;
+            return 0;
+        };
+
+        if (extra.bench) {
+            BenchMeta abm = make_bench_meta("attributed", opts, extra, model.backend_active(),
+                                            samples.size(), sr, audio_ms, load_ms, wav_ms);
+            abm.stage_split = false;
+            return run_bench_lane(abm, extra, attributed_once, [&](BenchMeta & m) {
+                print_attributed_segments(attr, emit_fmt);
+                m.counts.emplace_back("asr_calls",       (long long) attr.asr_calls);
+                m.counts.emplace_back("diar_segments",   (long long) attr.diarization.segments.size());
+                m.counts.emplace_back("merged_segments", (long long) attr.segments.size());
+            });
         }
+
+        RunTimes attr_times;
+        if (int rc = attributed_once(attr_times); rc != 0) return rc;
+        print_attributed_segments(attr, emit_fmt);
         if (opts.verbose) {
             PARAKEET_LOG_INFO(
                 "[attributed] audio=%.2fs samples=%zu@%dHz diar.segments=%zu asr_calls=%d\n"
@@ -611,6 +887,10 @@ extern "C" int parakeet_cli_main(int argc, char ** argv) {
     }
 
     if (model.model_type == ParakeetModelType::SORTFORMER) {
+        if (extra.profile) {
+            PARAKEET_LOG_ERROR("error: --profile is not supported for Sortformer; use --bench\n");
+            return 2;
+        }
         EngineOptions eopts;
         eopts.model_gguf_path = opts.model_gguf_path;
         eopts.n_gpu_layers    = opts.n_gpu_layers;
@@ -632,7 +912,6 @@ extern "C" int parakeet_cli_main(int argc, char ** argv) {
                                  ? extra.attributed_min_segment_ms : 200;
 
             int seg_count = 0;
-            const auto t_stream_start = std::chrono::steady_clock::now();
             auto on_seg = [&](const StreamingDiarizationSegment & s) {
                 if (s.speaker_id < 0) return;
                 ++seg_count;
@@ -649,19 +928,40 @@ extern "C" int parakeet_cli_main(int argc, char ** argv) {
                 std::fflush(stdout);
             };
 
-            auto session = engine.diarize_start(sopts, on_seg);
             const int chunk_samples = sr * sopts.chunk_ms / 1000;
             const int feed = extra.stream_feed_bytes > 0
                            ? std::max(1, extra.stream_feed_bytes / (int) sizeof(float))
                            : chunk_samples;
-            for (size_t off = 0; off < samples.size(); off += feed) {
-                const int n = (int) std::min<size_t>(feed, samples.size() - off);
-                session->feed_pcm_f32(samples.data() + off, n);
-            }
-            session->finalize();
-            const double stream_ms =
-                std::chrono::duration_cast<std::chrono::microseconds>(
+            double stream_ms = 0.0;
+            auto diarize_stream_once = [&](RunTimes & t) -> int {
+                seg_count = 0;
+                const auto t_stream_start = std::chrono::steady_clock::now();
+                auto session = engine.diarize_start(sopts, on_seg);
+                for (size_t off = 0; off < samples.size(); off += feed) {
+                    const int n = (int) std::min<size_t>(feed, samples.size() - off);
+                    session->feed_pcm_f32(samples.data() + off, n);
+                }
+                session->finalize();
+                stream_ms = std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - t_stream_start).count() / 1000.0;
+                t.inference_ms = stream_ms;
+                return 0;
+            };
+
+            if (extra.bench) {
+                BenchMeta sbm = make_bench_meta("sortformer-stream", opts, extra,
+                                                model.backend_active(), samples.size(), sr,
+                                                audio_ms, load_ms, wav_ms);
+                sbm.stage_split = false;
+                return run_bench_lane(sbm, extra, diarize_stream_once, [&](BenchMeta & m) {
+                    m.counts.emplace_back("segments",   (long long) seg_count);
+                    m.counts.emplace_back("chunk_ms",   (long long) sopts.chunk_ms);
+                    m.counts.emplace_back("history_ms", (long long) sopts.history_ms);
+                });
+            }
+
+            RunTimes stream_times;
+            if (int rc = diarize_stream_once(stream_times); rc != 0) return rc;
 
             if (opts.verbose) {
                 PARAKEET_LOG_INFO(
@@ -675,18 +975,31 @@ extern "C" int parakeet_cli_main(int argc, char ** argv) {
         }
 
         DiarizationOptions dopts;
-        DiarizationResult diar = engine.diarize_samples(
-            samples.data(), (int) samples.size(), sr, dopts);
+        DiarizationResult diar;
+        auto diarize_once = [&](RunTimes & t) -> int {
+            diar = engine.diarize_samples(samples.data(), (int) samples.size(), sr, dopts);
+            t.mel_ms         = diar.preprocess_ms;
+            t.enc_ms         = diar.encoder_ms;
+            t.dec_ms         = diar.decode_ms;
+            t.inference_ms   = diar.total_ms;
+            t.encoder_frames = diar.n_frames;
+            return 0;
+        };
 
-        for (const auto & s : diar.segments) {
-            if (emit_fmt == "jsonl") {
-                std::printf("{\"speaker\":%d,\"start\":%.3f,\"end\":%.3f}\n",
-                            s.speaker_id, s.start_s, s.end_s);
-            } else {
-                std::printf("[%.2f-%.2f] speaker_%d\n",
-                            s.start_s, s.end_s, s.speaker_id);
-            }
+        if (extra.bench) {
+            BenchMeta dbm = make_bench_meta("sortformer", opts, extra, model.backend_active(),
+                                            samples.size(), sr, audio_ms, load_ms, wav_ms);
+            return run_bench_lane(dbm, extra, diarize_once, [&](BenchMeta & m) {
+                print_diarization_segments(diar, emit_fmt);
+                m.mel_frames = diar.n_frames;
+                m.counts.emplace_back("segments", (long long) diar.segments.size());
+                m.counts.emplace_back("num_spks", (long long) diar.num_spks);
+            });
         }
+
+        RunTimes diar_times;
+        if (int rc = diarize_once(diar_times); rc != 0) return rc;
+        print_diarization_segments(diar, emit_fmt);
         if (opts.verbose) {
             PARAKEET_LOG_INFO(
                 "[diarize] load=%.1fms audio=%.2fs samples=%zu@%dHz frames=%d num_spks=%d\n"
@@ -973,6 +1286,11 @@ extern "C" int parakeet_cli_main(int argc, char ** argv) {
     }
 
     if (extra.stream) {
+        if (extra.bench) {
+            PARAKEET_LOG_ERROR("error: --bench is not supported with --stream on a transcription\n"
+                                 "       model; drop --stream to benchmark the offline path\n");
+            return 2;
+        }
         EngineOptions eopts;
         eopts.model_gguf_path = opts.model_gguf_path;
         eopts.n_gpu_layers    = opts.n_gpu_layers;
@@ -1061,141 +1379,13 @@ extern "C" int parakeet_cli_main(int argc, char ** argv) {
         return 0;
     }
 
-    PARAKEET_LOG_INFO("[bench] model=%s  wav=%s (%.2f s audio, %d samples @ %d Hz)\n",
-                 opts.model_gguf_path.c_str(), opts.wav_path.c_str(),
-                 audio_ms / 1000.0, (int) samples.size(), sr);
-    PARAKEET_LOG_INFO("[bench] threads=%d  warmup=%d  runs=%d\n",
-                 opts.n_threads, extra.bench_warmup, extra.bench_runs);
-    PARAKEET_LOG_INFO("[bench] load=%.1fms wav_read=%.1fms\n", load_ms, wav_ms);
-
-    for (int w = 0; w < extra.bench_warmup; ++w) {
-        RunTimes t;
-        if (int rc = run_once(text, ids, n_frames, t); rc != 0) return 10 + rc;
-        PARAKEET_LOG_INFO("[bench] warmup %d/%d  mel=%.1fms enc=%.1fms dec=%.1fms  RTF=%.3f\n",
-                     w + 1, extra.bench_warmup, t.mel_ms, t.enc_ms, t.dec_ms, t.inference_ms / audio_ms);
-    }
-
-    std::vector<double> mel_v, enc_v, dec_v, inf_v;
-    mel_v.reserve(extra.bench_runs);
-    enc_v.reserve(extra.bench_runs);
-    dec_v.reserve(extra.bench_runs);
-    inf_v.reserve(extra.bench_runs);
-
-    int enc_frames_last = 0;
-    for (int r = 0; r < extra.bench_runs; ++r) {
-        RunTimes t;
-        if (int rc = run_once(text, ids, n_frames, t); rc != 0) return 20 + rc;
-        mel_v.push_back(t.mel_ms);
-        enc_v.push_back(t.enc_ms);
-        dec_v.push_back(t.dec_ms);
-        inf_v.push_back(t.inference_ms);
-        enc_frames_last = t.encoder_frames;
-        PARAKEET_LOG_INFO("[bench] run %d/%d    mel=%.1fms enc=%.1fms dec=%.1fms inference=%.1fms  RTF=%.3f\n",
-                     r + 1, extra.bench_runs, t.mel_ms, t.enc_ms, t.dec_ms,
-                     t.inference_ms, t.inference_ms / audio_ms);
-    }
-
-    std::printf("%s\n", text.c_str());
-
-    const AggStats s_mel = aggregate(mel_v);
-    const AggStats s_enc = aggregate(enc_v);
-    const AggStats s_dec = aggregate(dec_v);
-    const AggStats s_inf = aggregate(inf_v);
-    const double   rtf_median = s_inf.median / audio_ms;
-    const double   rtf_best   = s_inf.min    / audio_ms;
-    const double   rtf_mean   = s_inf.mean   / audio_ms;
-    const bool     noisy      = s_inf.stdev > 0.2 * s_inf.mean;
-
-    PARAKEET_LOG_INFO(
-        "[bench] ----------- summary (%d timed runs, warmup excluded) -----------\n"
-        "[bench]   audio              = %.3f s (%zu samples @ %d Hz)\n"
-        "[bench]   model load         = %.1f ms\n"
-        "[bench]   wav read           = %.1f ms\n"
-        "[bench]                         mean      med       min       max       std\n"
-        "[bench]   mel        ms    %8.2f  %7.2f  %7.2f  %7.2f  %7.2f\n"
-        "[bench]   encoder    ms    %8.2f  %7.2f  %7.2f  %7.2f  %7.2f\n"
-        "[bench]   decode     ms    %8.2f  %7.2f  %7.2f  %7.2f  %7.2f\n"
-        "[bench]   inference  ms    %8.2f  %7.2f  %7.2f  %7.2f  %7.2f\n"
-        "[bench]   RTF (median/best) = %.3f / %.3f    (realtime multiple = %.1fx / %.1fx)\n"
-        "[bench]   tokens             = %d%s\n"
-        "[bench] ---------------------------------------------------------------%s\n",
-        extra.bench_runs, audio_ms / 1000.0, samples.size(), sr,
-        load_ms, wav_ms,
-        s_mel.mean, s_mel.median, s_mel.min, s_mel.max, s_mel.stdev,
-        s_enc.mean, s_enc.median, s_enc.min, s_enc.max, s_enc.stdev,
-        s_dec.mean, s_dec.median, s_dec.min, s_dec.max, s_dec.stdev,
-        s_inf.mean, s_inf.median, s_inf.min, s_inf.max, s_inf.stdev,
-        rtf_median, rtf_best,
-        (rtf_median > 0 ? 1.0 / rtf_median : 0.0),
-        (rtf_best   > 0 ? 1.0 / rtf_best   : 0.0),
-        (int) ids.size(),
-        noisy ? "  (WARNING: stdev > 20% of mean — consider more warmup / runs)" : "",
-        noisy ? "\n[bench] prefer the median / best RTF — mean is skewed by outliers." : "");
-
-    if (!extra.bench_json_path.empty()) {
-        FILE * fp = std::fopen(extra.bench_json_path.c_str(), "w");
-        if (!fp) {
-            PARAKEET_LOG_ERROR("error: cannot open %s for writing\n", extra.bench_json_path.c_str());
-            return 30;
-        }
-        auto fmt_stats = [&](const char * name, const AggStats & s, const std::vector<double> & v) {
-            std::fprintf(fp, "    \"%s_ms\": {\"mean\": %.3f, \"median\": %.3f, \"stdev\": %.3f, \"min\": %.3f, \"max\": %.3f, \"samples\": [",
-                         name, s.mean, s.median, s.stdev, s.min, s.max);
-            for (size_t i = 0; i < v.size(); ++i) std::fprintf(fp, "%s%.3f", i == 0 ? "" : ", ", v[i]);
-            std::fprintf(fp, "]}");
-        };
-        std::fprintf(fp, "{\n");
-        std::fprintf(fp, "  \"model\": \"%s\",\n",  opts.model_gguf_path.c_str());
-        std::fprintf(fp, "  \"wav\": \"%s\",\n",    opts.wav_path.c_str());
-        // Runtime-accurate backend label. Reads the post-fallback active
-        // backend off the loaded model rather than guessing from
-        // compile-time #ifdefs. Covers OpenCL (which the previous
-        // ifdef cascade missed entirely) and disambiguates correctly
-        // when multiple GPU backends are compiled into the same
-        // binary -- ggml_backend_name() prints what was actually
-        // selected by `init_gpu_backend()`'s registry tier policy.
-        // Format mirrors the legacy strings
-        // ("ggml-metal" / "ggml-cuda" / etc.) so downstream bench
-        // sweeps that grep on these labels keep working; we just
-        // lower-case ggml_backend_name's "Metal" / "CUDA0" / "OpenCL"
-        // to "ggml-metal" / "ggml-cuda0" / "ggml-opencl".
-        std::string backend_label;
-        if (ggml_backend_t b = model.backend_active(); b != nullptr) {
-            const char * raw = ggml_backend_name(b);
-            backend_label = std::string("ggml-") + (raw ? raw : "cpu");
-            std::transform(backend_label.begin(), backend_label.end(),
-                           backend_label.begin(),
-                           [](unsigned char c) { return std::tolower(c); });
-        } else {
-            backend_label = "ggml-cpu";
-        }
-        std::fprintf(fp, "  \"backend\": \"%s\",\n", backend_label.c_str());
-        std::fprintf(fp, "  \"n_gpu_layers\": %d,\n", opts.n_gpu_layers);
-        std::fprintf(fp, "  \"threads\": %d,\n",    opts.n_threads);
-        std::fprintf(fp, "  \"warmup_runs\": %d,\n", extra.bench_warmup);
-        std::fprintf(fp, "  \"timed_runs\":  %d,\n", extra.bench_runs);
-        std::fprintf(fp, "  \"audio_seconds\": %.6f,\n", audio_ms / 1000.0);
-        std::fprintf(fp, "  \"audio_samples\": %zu,\n", samples.size());
-        std::fprintf(fp, "  \"sample_rate\": %d,\n", sr);
-        std::fprintf(fp, "  \"mel_frames\": %d,\n",  n_frames);
-        std::fprintf(fp, "  \"encoder_frames\": %d,\n", enc_frames_last);
-        std::fprintf(fp, "  \"tokens\": %d,\n",      (int) ids.size());
-        std::fprintf(fp, "  \"transcript\": \"");
-        for (char c : text) { if (c == '"') std::fputs("\\\"", fp); else if (c == '\\') std::fputs("\\\\", fp); else std::fputc(c, fp); }
-        std::fprintf(fp, "\",\n");
-        std::fprintf(fp, "  \"load_ms\": %.3f,\n",       load_ms);
-        std::fprintf(fp, "  \"wav_read_ms\": %.3f,\n",   wav_ms);
-        fmt_stats("mel",       s_mel, mel_v);           std::fprintf(fp, ",\n");
-        fmt_stats("encoder",   s_enc, enc_v);           std::fprintf(fp, ",\n");
-        fmt_stats("decode",    s_dec, dec_v);           std::fprintf(fp, ",\n");
-        fmt_stats("inference", s_inf, inf_v);           std::fprintf(fp, ",\n");
-        std::fprintf(fp, "    \"rtf_mean\":   %.6f,\n", rtf_mean);
-        std::fprintf(fp, "    \"rtf_median\": %.6f,\n", rtf_median);
-        std::fprintf(fp, "    \"rtf_best\":   %.6f\n",  rtf_best);
-        std::fprintf(fp, "}\n");
-        std::fclose(fp);
-        PARAKEET_LOG_INFO("[bench] wrote %s\n", extra.bench_json_path.c_str());
-    }
-
-    return 0;
+    BenchMeta bm = make_bench_meta("asr", opts, extra, model.backend_active(),
+                                   samples.size(), sr, audio_ms, load_ms, wav_ms);
+    auto transcribe_once = [&](RunTimes & t) -> int { return run_once(text, ids, n_frames, t); };
+    return run_bench_lane(bm, extra, transcribe_once, [&](BenchMeta & m) {
+        std::printf("%s\n", text.c_str());
+        m.mel_frames = n_frames;
+        m.transcript = text;
+        m.counts.emplace_back("tokens", (long long) ids.size());
+    });
 }
