@@ -309,6 +309,18 @@ if (AUDIOGEN_BUILD_TESTS)
             )
             set_property(TEST test-minimax-converter PROPERTY LABELS "unit")
             set_property(TEST test-minimax-converter PROPERTY ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+            add_test(NAME test-minimax-quant-audit
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_audit_quant_types.py
+            )
+            set_property(TEST test-minimax-quant-audit PROPERTY LABELS "unit")
+            set_property(TEST test-minimax-quant-audit PROPERTY ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+            add_test(NAME test-minimax-dump-compare
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_compare_ar_dumps.py
+            )
+            set_property(TEST test-minimax-dump-compare PROPERTY LABELS "unit")
+            set_property(TEST test-minimax-dump-compare PROPERTY ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
         endif()
     endif()
 
