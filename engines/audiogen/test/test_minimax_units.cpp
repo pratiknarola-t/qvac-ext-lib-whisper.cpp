@@ -1083,7 +1083,7 @@ void test_model_pair_resolution_q4() {
     namespace fs = std::filesystem;
     using tts_cpp::minimax::detail::ModelPair;
     using tts_cpp::minimax::detail::resolve_model_pair;
-    const fs::path root = fs::path("/tmp/tether") /
+    const fs::path root = fs::temp_directory_path() /
                           ("minimax-model-pair-q4-" + std::to_string(std::random_device{}()));
     fs::create_directories(root);
     touch(root / "mm3-lm-q4_k_m.gguf");
@@ -1103,7 +1103,7 @@ void test_model_pair_resolution_f32() {
     namespace fs = std::filesystem;
     using tts_cpp::minimax::detail::ModelPair;
     using tts_cpp::minimax::detail::resolve_model_pair;
-    const fs::path root = fs::path("/tmp/tether") /
+    const fs::path root = fs::temp_directory_path() /
                           ("minimax-model-pair-f32-" + std::to_string(std::random_device{}()));
     fs::create_directories(root);
     touch(root / "mm3-lm-f32.gguf");
