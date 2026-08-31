@@ -209,7 +209,7 @@ The per-engine `whisper-cpp`, `parakeet-cpp`, `tts-cpp` and `audiogen-cpp` ports
 | `audio8-cli` | tts | Audio8 synthesis and zero-shot voice cloning |
 | `music-cli` | audiogen | end-to-end text-to-music |
 | `acestep-cli` | audiogen | Oobleck VAE decode and roundtrip harness |
-| `acestep-quantize` | audiogen | requantize converted ACE-Step stage GGUFs |
+| `acestep-quantize` | audiogen | requantize converted ACE-Step or MiniMax-Music3 stage GGUFs |
 | `mm3-replay` | audiogen | MiniMax-Music3 generation and parity harness |
 | `lavasr-bench` | tts | denoiser and enhancer benchmark |
 | `mel2wav` | tts | HiFT mel to wav |

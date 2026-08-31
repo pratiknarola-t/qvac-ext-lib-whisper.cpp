@@ -119,7 +119,8 @@ ACE-Step engine):
 This quantizes the LM and, within the synth file, the flow DiT to the chosen
 k-quant while the RVQ depth decoder is held at `q8_0` (its per-frame matvec
 graphs need the integer fast path; F16 weights are several times slower on
-scalar-fp16 Vulkan devices) and the condition encoder and vocoder keep their
+scalar-fp16 Vulkan devices), except `depth.pos_embd.weight`, which the depth
+graph views raw and which stays F32. The condition encoder and vocoder keep their
 converted (F16/F32) precision. Quantize from the `f16` pair, not `q8_0` —
 `acestep-quantize` only requantizes BF16/F16/F32 source tensors, so an
 already-`q8_0` tensor passes through untouched.
@@ -602,8 +603,9 @@ cmake --build build/audiogen -j
 ctest --test-dir build/audiogen
 ```
 
-`test-acestep-units`, `test-acestep-converter`, `test-minimax-units`, and
-`test-minimax-converter` cover weight-free CPU logic and need no GGUFs.
+`test-acestep-units`, `test-acestep-converter`, `test-minimax-units`,
+`test-minimax-converter`, `test-minimax-quant-audit`, and
+`test-minimax-dump-compare` cover weight-free CPU logic and need no GGUFs.
 ACE-Step coverage includes the BPE tokenizer (UTF-8 decode, merges, byte
 fallback, decode round-trip) on a hand-built vocabulary. MiniMax coverage
 includes metadata compatibility, model-pair selection, Unicode token classes,
@@ -629,14 +631,18 @@ are supplied and otherwise reports a skipped test.
 `node:test` suites (`benchmarks/comparison/tests/`) on hosts with node,
 so the harness's adapters, aggregation, and report logic stay verified.
 
-Stage dumps are the tool for localising a backend divergence. Run the same prompt twice with `--dump-stages`, then compare:
+Dumps are the tool for localising a backend divergence. Run the same prompt twice with `--dump-stages` (ACE-Step stages) or `--dump-iters` (MiniMax AR iterations), then compare:
 
 | Script | Purpose |
 |---|---|
 | `scripts/stage_cos.py` | per-stage cosine and rel_l2 between two dump directories; fails under a worst-stage cosine of 0.999, and also on a missing, truncated, or mismatched counterpart |
 | `scripts/dequant_gguf.py` | rewrite a GGUF with every quantized tensor dequantized to F32, giving a ground-truth trajectory to compare a quantized run against |
+| `scripts/compare_ar_dumps.py` | finite-subset cosine, argmax agreement, and top-8 overlap between two `--dump-iters` directories; gates on `--min-cosine` / `--min-argmax-agree` and fails a pair it could not actually compare |
+| `scripts/audit_quant_types.py` | audit a quantized GGUF against the deny-list of tensors that must never be quantized, plus a per-type byte summary |
 
-Both need `numpy`; `dequant_gguf.py` also needs `gguf`.
+`stage_cos.py` and `dequant_gguf.py` need `numpy`; `dequant_gguf.py` and
+`audit_quant_types.py` also need `gguf`. `compare_ar_dumps.py` uses `numpy`
+when it is installed and falls back to an equivalent stdlib path when it is not.
 
 An informal local comparison against upstream `acestep.cpp` measured 0.98 to
 0.99 end-to-end correlation on identical codes, and LM greedy decoding matched
